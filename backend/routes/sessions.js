@@ -82,7 +82,7 @@ router.post('/', async (req, res) => {
       businessId,
       businessName,
       registeredAddress,
-      status           : geoScore === 0 ? 'PROCESSING' : 'PROCESSING',
+      status     :   'PENDING',
       geoScore,
       gpsDistanceMetres,
       meta: {
