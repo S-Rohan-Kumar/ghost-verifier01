@@ -14,7 +14,7 @@ import cron    from "node-cron";
 import Session from "../models/Session.js";
 import { io }  from "../index.js";
 
-const MS_PER_HOUR = 60 * 60 * 1000;
+const MS_PER_HOUR = 2 * 1000;
 
 // ── Thresholds (hours since triggeredAt) ──────────────────────
 const T_REMINDER       = 12;   // log a reminder, no status change
