@@ -22,9 +22,19 @@
 //    POST /api/audit/:sessionId/submit    → mobile uploads audit video
 //    POST /api/audit/cv-result            → Lambda posts CV result
 //    GET  /api/audit/:sessionId/status    → poll current state
+//    GET  /api/audit/pending              → check pending audit by businessId
 //
 //  Exported function (not a route):
 //    autoTriggerAudit(sessionId, anchorS3Key)  ← called by sessions.js
+//
+//  FIX: setImmediate(() => runCvAnalysis(...)) has been REMOVED from the
+//  submit route. The backend was running its own CV analysis in parallel
+//  with the S3-triggered auditLambda.mjs, creating a race condition where
+//  whichever finished last would overwrite the DB — often the backend's
+//  analysis (which ran against the still-uploading 0-byte object) would
+//  win and incorrectly REJECT a legitimate audit. auditLambda.mjs is the
+//  sole CV processor. runCvAnalysis() is kept as a named export for use
+//  in tests and manual admin tooling only.
 // ═══════════════════════════════════════════════════════════════
 import express from "express";
 import Session from "../models/Session.js";
@@ -71,12 +81,13 @@ async function compareFaces(bucket, anchorKey, auditKey) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  runCvAnalysis — fires via setImmediate after submit response.
-//  Does NOT depend on S3 event trigger or Lambda.
-//  If auditThumbKey is null (snapshot failed), falls back to
-//  label-only scoring against empty set → scores 0 → REJECTED.
+//  runCvAnalysis — kept for manual admin use / tests only.
+//  NOT called automatically on submit — auditLambda.mjs handles that.
+//  Calling this in parallel with the Lambda caused a race condition
+//  where the backend (working against a 0-byte S3 object that was
+//  still uploading) would overwrite the Lambda's correct result.
 // ─────────────────────────────────────────────────────────────────
-async function runCvAnalysis(sessionId, auditThumbKey) {
+export async function runCvAnalysis(sessionId, auditThumbKey) {
   const startMs = Date.now();
   console.log(`[CvAnalysis] ${sessionId} | thumb: ${auditThumbKey ?? "none"}`);
   try {
@@ -295,14 +306,24 @@ router.post("/:sessionId/trigger", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────
 //  POST /api/audit/:sessionId/submit
 //  Called by the React Native app after uploading the audit
-//  thumbnail to S3 (audit-thumbnails/ prefix).
+//  thumbnail + video to S3.
 //  Moves auditStatus → SUBMITTED.
-//  The S3 PutObject event then fires auditLambda.mjs automatically.
+//  The S3 PutObject event on audit-thumbnails/ fires auditLambda.mjs
+//  automatically — that Lambda is the sole CV processor.
+//
+//  FIX: setImmediate(() => runCvAnalysis(...)) has been REMOVED.
+//  Running backend CV in parallel with the Lambda caused a race:
+//    1. App submits → backend runCvAnalysis fires immediately
+//    2. auditThumbKey may not yet be in S3 (XHR still in flight)
+//    3. Backend Rekognition call gets 0-byte or missing object → 0% score → REJECTED
+//    4. Lambda fires seconds later with the real image → correct score
+//    5. But the backend result already overwrote the DB → wrong verdict
+//  The Lambda alone is the source of truth for CV results.
 // ─────────────────────────────────────────────────────────────────
 router.post("/:sessionId/submit", async (req, res) => {
   try {
     const { sessionId } = req.params;
-    const { auditS3ThumbUri, auditS3VideoUri } = req.body;
+    const { auditS3ThumbUri, auditS3VideoUri, gps } = req.body;
 
     const session = await Session.findOne({ sessionId });
     if (!session) {
@@ -334,11 +355,15 @@ router.post("/:sessionId/submit", async (req, res) => {
           "surpriseAudit.submittedAt"    : now,
           "surpriseAudit.auditS3ThumbUri": auditS3ThumbUri ?? null,
           "surpriseAudit.auditS3VideoUri": auditS3VideoUri ?? null,
+          // Store audit GPS if provided
+          ...(gps?.lat && gps?.lng ? {
+            "surpriseAudit.auditGps": { lat: gps.lat, lng: gps.lng },
+          } : {}),
         },
         $push: {
           auditLog: {
             action: "AUDIT_SUBMITTED",
-            detail: `Audit video submitted. Thumb: ${auditS3ThumbUri ?? "none"}. CV analysis queued via S3 trigger.`,
+            detail: `Audit submitted. Thumb: ${auditS3ThumbUri ?? "none"}. Video: ${auditS3VideoUri ?? "none"}. Lambda CV analysis triggered via S3 event.`,
           },
         },
       }
@@ -350,16 +375,20 @@ router.post("/:sessionId/submit", async (req, res) => {
       submittedAt: now.toISOString(),
     });
 
-    console.log(`[audit/submit] SUBMITTED — ${sessionId}`);
+    console.log(`[audit/submit] SUBMITTED — ${sessionId} | thumb: ${auditS3ThumbUri ?? "none"} | video: ${auditS3VideoUri ?? "none"}`);
 
     res.json({
       success    : true,
       sessionId,
       auditStatus: "SUBMITTED",
-      message    : "Audit video received. Visual continuity analysis is running.",
+      message    : "Audit received. Visual analysis is running via Lambda — result will arrive shortly.",
     });
 
-    // Run CV analysis in background — does not block response
+    // ── NO setImmediate(runCvAnalysis) here ──────────────────────
+    // auditLambda.mjs fires automatically when the thumbnail lands in
+    // audit-thumbnails/ on S3. Running a second analysis here in parallel
+    // caused a race condition that corrupted the final verdict.
+    // See file header for full explanation.
 
   } catch (err) {
     console.error("[POST /audit/submit]", err);
@@ -462,7 +491,7 @@ router.post("/cv-result", async (req, res) => {
 //  Called by AuditOverlay on app mount to check whether this business
 //  has a live audit that was triggered while the app was closed.
 //  Returns the most recent non-terminal audit session, or 404.
-//  Non-terminal: REQUESTED | WARNING | REVIEW_PENDING | SUBMITTED
+//  Non-terminal: REQUESTED | WARNING | REVIEW_PENDING
 // ─────────────────────────────────────────────────────────────────
 router.get("/pending", async (req, res) => {
   try {
@@ -471,7 +500,7 @@ router.get("/pending", async (req, res) => {
       return res.status(400).json({ error: "businessId query param required" });
     }
 
-    // SUBMITTED is excluded — business has already done their part, let them log in normally
+    // SUBMITTED is excluded — business has already done their part
     const LIVE_STATUSES = ["REQUESTED", "WARNING", "REVIEW_PENDING"];
 
     const session = await Session.findOne(

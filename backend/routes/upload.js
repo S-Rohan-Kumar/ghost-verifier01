@@ -21,6 +21,15 @@
 //    AWS_REGION      — e.g. ap-south-1
 //    AWS_ACCESS_KEY_ID
 //    AWS_SECRET_ACCESS_KEY
+//
+//  FIX: ContentType is intentionally NOT included in PutObjectCommand.
+//  When ContentType is signed into the presigned URL, AWS enforces that
+//  the client's Content-Type header matches exactly. React Native's XHR
+//  (and fetch) can send a slightly different value (e.g. application/octet-stream
+//  vs image/jpeg), causing a 403 SignatureDoesNotMatch that the app silently
+//  swallows — the upload appears to succeed but the S3 object is never written.
+//  Removing ContentType from the signature lets the client send any
+//  Content-Type freely; S3 stores whatever arrives without rejecting it.
 // ═══════════════════════════════════════════════════════════════
 import express         from "express";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
@@ -40,12 +49,21 @@ const s3 = new S3Client({
 const BUCKET      = process.env.S3_BUCKET;
 const URL_EXPIRES = 300; // 5 minutes — plenty for a mobile upload
 
-// ── Key prefix + content-type per upload type ────────────────
+// Fail loud at startup so env var mismatches are immediately visible in logs.
+if (!BUCKET) {
+  console.error("[upload] FATAL: S3_BUCKET env var is not set.");
+} else {
+  console.log(`[upload] S3 bucket: ${BUCKET}`);
+}
+
+// ── Key prefix per upload type ────────────────────────────────
+// contentType is kept here only for logging / key extension logic.
+// It is NOT passed to PutObjectCommand — see fix note in header.
 const TYPE_CONFIG = {
-  "thumbnail"      : { prefix: "thumbnails",       contentType: "image/jpeg" },
-  "video"          : { prefix: "videos",            contentType: "video/mp4"  },
-  "audit-thumbnail": { prefix: "audit-thumbnails",  contentType: "image/jpeg" }, // ← S3 trigger fires auditLambda
-  "audit-video"    : { prefix: "audit-videos",      contentType: "video/mp4"  },
+  "thumbnail"      : { prefix: "thumbnails",      contentType: "image/jpeg" },
+  "video"          : { prefix: "videos",           contentType: "video/mp4"  },
+  "audit-thumbnail": { prefix: "audit-thumbnails", contentType: "image/jpeg" }, // ← S3 trigger fires auditLambda
+  "audit-video"    : { prefix: "audit-videos",     contentType: "video/mp4"  },
 };
 
 // ─────────────────────────────────────────────────────────────────
@@ -82,10 +100,19 @@ router.get("/presigned-url", async (req, res) => {
     const timestamp = Date.now();
     const s3Key     = `${cfg.prefix}/${sessionId}_${timestamp}.${ext}`;
 
+    // ─────────────────────────────────────────────────────────
+    //  FIX: ContentType deliberately omitted from PutObjectCommand.
+    //  Including it causes AWS to embed it in the request signature.
+    //  If the client sends a different Content-Type header (which
+    //  React Native XHR does — it may send application/octet-stream),
+    //  S3 returns 403 SignatureDoesNotMatch. The mobile app's .catch()
+    //  swallows this silently, the upload never lands, but the key
+    //  is still saved to DB as if it succeeded.
+    // ─────────────────────────────────────────────────────────
     const command = new PutObjectCommand({
-      Bucket      : BUCKET,
-      Key         : s3Key,
-      ContentType : cfg.contentType,
+      Bucket: BUCKET,
+      Key   : s3Key,
+      // ContentType intentionally omitted
     });
 
     const uploadUrl = await getSignedUrl(s3, command, { expiresIn: URL_EXPIRES });
