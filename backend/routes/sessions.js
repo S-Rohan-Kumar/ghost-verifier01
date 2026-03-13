@@ -8,7 +8,7 @@
 //  ✅ Layer 1 — Liveness enforcement (SPOOF_DETECTED / SUSPICIOUS)
 //  ✅ Layer 2 — Accelerometer / motion analysis
 //  ✅ Layer 3 — Screen recording enforcement
-//  ✅ autoTriggerAudit called after PASSED (surprise audit system)
+//  ✅ Surprise audit is manual-only — triggered by banker from dashboard
 // ═══════════════════════════════════════════════════════════════
 import express  from "express";
 import Session  from "../models/Session.js";
@@ -22,7 +22,7 @@ import {
   GEO_DISTANCE_THRESHOLD_METRES,
 } from "../config/scoring.js";
 import { analyseAccelerometer } from "../config/accelerometer.js";
-import { autoTriggerAudit }     from "./audit.js";
+
 
 const router = express.Router();
 
@@ -193,7 +193,6 @@ router.post("/", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────
 //  POST /api/sessions/ai-result
 //  Called by AWS Lambda after Rekognition analysis completes.
-//  ✅ NEW: calls autoTriggerAudit when status === "PASSED"
 // ─────────────────────────────────────────────────────────────────
 router.post("/ai-result", async (req, res) => {
   try {
@@ -357,14 +356,6 @@ router.post("/ai-result", async (req, res) => {
       screenRecording: screenRecording ?? null,
       timestamp      : new Date().toISOString(),
     });
-
-    // ── NEW: Auto-trigger surprise audit on PASSED sessions ───────
-    // Fire-and-forget — non-fatal if it fails (session result already saved)
-    if (status === "PASSED") {
-      autoTriggerAudit(sessionId, s3Key).catch((e) =>
-        console.warn(`[autoTriggerAudit] Non-fatal for ${sessionId}:`, e.message)
-      );
-    }
 
     console.log(
       `[ai-result] ✅ ${sessionId} → Score: ${trustScore} | Status: ${status} | ` +
