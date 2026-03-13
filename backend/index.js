@@ -2,59 +2,61 @@
 //  Ghost Business Verifier — Backend Entry Point
 //  index.js
 // ═══════════════════════════════════════════════════════════════
-import express    from 'express';
-import http       from 'http';
-import { Server } from 'socket.io';
-import mongoose   from 'mongoose';
-import cors       from 'cors';
-import dotenv     from 'dotenv';
+import express from "express";
+import http from "http";
+import { Server } from "socket.io";
+import mongoose from "mongoose";
+import cors from "cors";
+import dotenv from "dotenv";
 
 // Load environment variables first
 dotenv.config();
 
 // ── Route Imports ────────────────────────────────────────────────
-import sessionRoutes    from './routes/sessions.js';
-import uploadRoutes     from './routes/upload.js';
-import businessRoutes   from './routes/businesses.js';
-import analyticsRoutes  from './routes/analytics.js';
+import sessionRoutes from "./routes/sessions.js";
+import uploadRoutes from "./routes/upload.js";
+import businessRoutes from "./routes/businesses.js";
+import analyticsRoutes from "./routes/analytics.js";
+import auditRoutes from "./routes/audit.js";
 
 // ── App Setup ────────────────────────────────────────────────────
-const app    = express();
+const app = express();
 const server = http.createServer(app);
 
 // ── Socket.io Setup ──────────────────────────────────────────────
 export const io = new Server(server, {
   cors: {
-    origin : '*',       // allow all origins for hackathon
-    methods: ['GET', 'POST']
-  }
+    origin: "*", // allow all origins for hackathon
+    methods: ["GET", "POST"],
+  },
 });
 
-io.on('connection', (socket) => {
+io.on("connection", (socket) => {
   console.log(`[Socket.io] Client connected: ${socket.id}`);
-  socket.on('disconnect', () => {
+  socket.on("disconnect", () => {
     console.log(`[Socket.io] Client disconnected: ${socket.id}`);
   });
 });
 
 // ── Middleware ───────────────────────────────────────────────────
-app.use(cors({ origin: '*' }));           // allow all for hackathon
-app.use(express.json({ limit: '10mb' })); // parse JSON bodies
+app.use(cors({ origin: "*" })); // allow all for hackathon
+app.use(express.json({ limit: "10mb" })); // parse JSON bodies
 app.use(express.urlencoded({ extended: true }));
 
 // ── Routes ───────────────────────────────────────────────────────
-app.use('/api/sessions',   sessionRoutes);
-app.use('/api/upload',     uploadRoutes);
-app.use('/api/businesses', businessRoutes);
-app.use('/api/analytics',  analyticsRoutes);
+app.use("/api/sessions", sessionRoutes);
+app.use("/api/upload", uploadRoutes);
+app.use("/api/businesses", businessRoutes);
+app.use("/api/analytics", analyticsRoutes);
+app.use("/api/audit", auditRoutes);
 
 // ── Health Check ─────────────────────────────────────────────────
-app.get('/', (req, res) => {
+app.get("/", (req, res) => {
   res.json({
-    service: 'Ghost Business Verifier API',
-    status : 'running',
-    version: '2.0.0',
-    time   : new Date().toISOString()
+    service: "Ghost Business Verifier API",
+    status: "running",
+    version: "2.0.0",
+    time: new Date().toISOString(),
   });
 });
 
@@ -62,9 +64,11 @@ app.get('/', (req, res) => {
 const connectDB = async () => {
   try {
     await mongoose.connect(process.env.MONGODB_URI);
-    console.log('[MongoDB] Connected successfully');
+    console.log("[MongoDB] Connected successfully");
+
+    import("./jobs/auditEnforcer.js");
   } catch (err) {
-    console.error('[MongoDB] Connection failed:', err.message);
+    console.error("[MongoDB] Connection failed:", err.message);
     // Retry after 5 seconds (helpful on Railway cold starts)
     setTimeout(connectDB, 5000);
   }
@@ -72,10 +76,13 @@ const connectDB = async () => {
 
 // ── Global Error Handler ─────────────────────────────────────────
 app.use((err, req, res, next) => {
-  console.error('[Error]', err.stack);
+  console.error("[Error]", err.stack);
   res.status(500).json({
-    error  : 'Internal server error',
-    message: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong'
+    error: "Internal server error",
+    message:
+      process.env.NODE_ENV === "development"
+        ? err.message
+        : "Something went wrong",
   });
 });
 

@@ -1,6 +1,10 @@
 // ═══════════════════════════════════════════════════════════════
 //  Ghost Business Verifier — Session Model
 //  models/Session.js
+//
+//  ✅ All original fields retained
+//  ✅ surpriseAudit subdocument added (replaces old auditMeta)
+//  ✅ Partial index on live audits for fast enforcer queries
 // ═══════════════════════════════════════════════════════════════
 import mongoose from "mongoose";
 
@@ -32,7 +36,7 @@ const SessionSchema = new mongoose.Schema(
     geoScore         : { type: Number, default: null },
     signScore        : { type: Number, default: null },
     infraScore       : { type: Number, default: null },
-    motionScore      : { type: Number, default: null },   // Layer 2
+    motionScore      : { type: Number, default: null },
     gpsDistanceMetres: { type: Number, default: null },
 
     // ── S3 assets ─────────────────────────────────────────────────
@@ -44,22 +48,17 @@ const SessionSchema = new mongoose.Schema(
       textDetected  : { type: String },
       labels        : [String],
       infraScore    : { type: Number },
-
-      // Layer 1 — Liveness
       livenessResult: {
         type   : String,
         enum   : ["LIVE", "SUSPICIOUS", "SPOOF_DETECTED", "NO_FACE", "UNKNOWN"],
         default: "UNKNOWN",
       },
-      livenessDetail: { type: String, default: "" },
-
-      // Layer 3 — Screen recording
+      livenessDetail : { type: String, default: "" },
       screenRecording: {
         detected  : { type: Boolean, default: false },
         confidence: { type: String, enum: ["HIGH", "MEDIUM", "LOW", null], default: null },
         reason    : { type: String, default: null },
       },
-
       isFlagged: { type: Boolean },
     },
 
@@ -71,8 +70,6 @@ const SessionSchema = new mongoose.Schema(
       gpsEnd        : { lat: Number, lng: Number },
       appVersion    : String,
       accelerometer : [{ x: Number, y: Number, z: Number, t: Number }],
-
-      // Layer 2 — full motion analysis result
       motionAnalysis: {
         result: {
           type   : String,
@@ -98,10 +95,77 @@ const SessionSchema = new mongoose.Schema(
     reviewedBy : { type: String },
     reviewedAt : { type: Date },
 
+    // ═════════════════════════════════════════════════════════════
+    //  SURPRISE AUDIT  (all fields null until triggered)
+    //
+    //  State machine:
+    //    null           → audit not triggered yet
+    //    REQUESTED      → T+0:  audit triggered (auto or manual)
+    //    WARNING        → T+24: user warned, deadline approaching
+    //    REVIEW_PENDING → T+48: auto-escalated to ops team
+    //    SUBMITTED      → audit video received, CV analysis running
+    //    PASSED         → CV similarity >= 75%, layout matches
+    //    REJECTED       → deadline missed OR layout mismatch
+    // ═════════════════════════════════════════════════════════════
+    surpriseAudit: {
+      auditStatus: {
+        type   : String,
+        enum   : ["REQUESTED", "WARNING", "REVIEW_PENDING", "SUBMITTED", "PASSED", "REJECTED", null],
+        default: null,
+        index  : true,
+      },
+
+      // ── Timing ────────────────────────────────────────────────
+      triggeredAt   : { type: Date, default: null },   // T+0
+      auditDeadline : { type: Date, default: null },   // T+0 + 60h
+      reminderSentAt: { type: Date, default: null },   // T+12 reminder logged
+      warningSentAt : { type: Date, default: null },   // T+24 WARNING set
+      submittedAt   : { type: Date, default: null },   // when audit video arrives
+
+      // ── Who triggered ─────────────────────────────────────────
+      triggeredBy: { type: String, default: null },    // "SYSTEM" or officer name
+
+      // ── Audit video S3 assets ─────────────────────────────────
+      auditS3VideoUri: { type: String, default: null },
+      auditS3ThumbUri: { type: String, default: null },
+
+      // ── Anchor frames from original session ───────────────────
+      // S3 keys the CV Lambda fetches for SSIM / label comparison
+      anchorFrameKeys: { type: [String], default: [] },
+
+      // ── Computer Vision results ───────────────────────────────
+      cvResult: {
+        similarityScore : { type: Number, default: null },   // 0–100 average
+        layoutMismatch  : { type: Boolean, default: null },  // true if < 75
+        frameComparisons: [
+          {
+            anchorKey      : String,
+            similarityScore: Number,
+            matchMethod    : String,  // "SSIM" | "FEATURE_MATCH"
+          },
+        ],
+        newLabels    : [String],   // labels in audit NOT in original
+        missingLabels: [String],   // labels in original NOT in audit
+        labelOverlap : { type: Number, default: null },  // 0–1 Jaccard
+        verdict      : { type: String, default: null },
+        processedAt  : { type: Date, default: null },
+      },
+    },
+
     // ── Audit trail ───────────────────────────────────────────────
     auditLog: { type: [AuditEntrySchema], default: [] },
   },
   { timestamps: true }
+);
+
+// Partial index — enforcer cron only scans live (non-terminal) audits
+SessionSchema.index(
+  { "surpriseAudit.auditStatus": 1, "surpriseAudit.auditDeadline": 1 },
+  {
+    partialFilterExpression: {
+      "surpriseAudit.auditStatus": { $nin: [null, "PASSED", "REJECTED"] },
+    },
+  }
 );
 
 export default mongoose.model("Session", SessionSchema);

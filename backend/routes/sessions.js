@@ -8,6 +8,7 @@
 //  ✅ Layer 1 — Liveness enforcement (SPOOF_DETECTED / SUSPICIOUS)
 //  ✅ Layer 2 — Accelerometer / motion analysis
 //  ✅ Layer 3 — Screen recording enforcement
+//  ✅ autoTriggerAudit called after PASSED (surprise audit system)
 // ═══════════════════════════════════════════════════════════════
 import express  from "express";
 import Session  from "../models/Session.js";
@@ -21,6 +22,7 @@ import {
   GEO_DISTANCE_THRESHOLD_METRES,
 } from "../config/scoring.js";
 import { analyseAccelerometer } from "../config/accelerometer.js";
+import { autoTriggerAudit }     from "./audit.js";
 
 const router = express.Router();
 
@@ -79,8 +81,6 @@ router.post("/", async (req, res) => {
     }
 
     // ── Layer 2: Accelerometer analysis ──────────────────────────
-    // Runs at session creation — accelerometer data arrives with GPS
-    // before the video is even uploaded to S3.
     const motionAnalysis = analyseAccelerometer(accelerometer);
     const motionScore    = motionAnalysis.motionScore;
 
@@ -193,8 +193,7 @@ router.post("/", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────
 //  POST /api/sessions/ai-result
 //  Called by AWS Lambda after Rekognition analysis completes.
-//  Lambda now sends: processingMs field (used for audit log).
-//  motionScore already on the session from POST / above.
+//  ✅ NEW: calls autoTriggerAudit when status === "PASSED"
 // ─────────────────────────────────────────────────────────────────
 router.post("/ai-result", async (req, res) => {
   try {
@@ -207,7 +206,7 @@ router.post("/ai-result", async (req, res) => {
       livenessResult,
       livenessDetail,
       screenRecording,
-      processingMs,                    // ← new from updated Lambda
+      processingMs,
       sessionId       : sessionIdFromBody,
     } = req.body;
 
@@ -268,9 +267,9 @@ router.post("/ai-result", async (req, res) => {
     const isFlagged = isFlaggedFromLambda || livenessIsFlagged || screenIsFlagged || motionIsFlagged;
 
     // Zero video-derived scores if video authenticity is compromised
-    const videoTrusted        = !livenessIsFlagged && !screenIsFlagged;
-    const effectiveSignScore  = videoTrusted ? signScore      : 0;
-    const effectiveInfraScore = videoTrusted ? infraScoreVal  : 0;
+    const videoTrusted         = !livenessIsFlagged && !screenIsFlagged;
+    const effectiveSignScore   = videoTrusted ? signScore      : 0;
+    const effectiveInfraScore  = videoTrusted ? infraScoreVal  : 0;
     const effectiveMotionScore = motionIsFlagged ? 0 : motionScore;
 
     const trustScore = computeTrustScore({
@@ -342,6 +341,7 @@ router.post("/ai-result", async (req, res) => {
       { new: true }
     );
 
+    // ── Emit session_complete to mobile app ───────────────────────
     io.emit("session_complete", {
       sessionId,
       trustScore,
@@ -357,6 +357,14 @@ router.post("/ai-result", async (req, res) => {
       screenRecording: screenRecording ?? null,
       timestamp      : new Date().toISOString(),
     });
+
+    // ── NEW: Auto-trigger surprise audit on PASSED sessions ───────
+    // Fire-and-forget — non-fatal if it fails (session result already saved)
+    if (status === "PASSED") {
+      autoTriggerAudit(sessionId, s3Key).catch((e) =>
+        console.warn(`[autoTriggerAudit] Non-fatal for ${sessionId}:`, e.message)
+      );
+    }
 
     console.log(
       `[ai-result] ✅ ${sessionId} → Score: ${trustScore} | Status: ${status} | ` +
@@ -481,23 +489,25 @@ router.delete("/:id", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────
+//  POST /api/sessions/login
+// ─────────────────────────────────────────────────────────────────
 router.post("/login", async (req, res) => {
   try {
     const { gstNumber, name } = req.body;
     console.log("[POST /login]", gstNumber, name);
-
 
     const business = await Business.findOne({ gstNumber, name });
 
     if (!business) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
-    console.log(business)
+    console.log(business);
 
-    return res.status(200).json({ 
-      success: true, 
-      businessId: business.businessId, 
-      name: business.name 
+    return res.status(200).json({
+      success   : true,
+      businessId: business.businessId,
+      name      : business.name,
     });
 
   } catch (err) {
@@ -505,6 +515,5 @@ router.post("/login", async (req, res) => {
     res.status(500).json({ error: "Server error during login" });
   }
 });
-
 
 export default router;
