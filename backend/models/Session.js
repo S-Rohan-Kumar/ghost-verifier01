@@ -32,20 +32,25 @@ const SessionSchema = new mongoose.Schema(
     geoScore         : { type: Number, default: null },
     signScore        : { type: Number, default: null },
     infraScore       : { type: Number, default: null },
+    motionScore      : { type: Number, default: null },   // Layer 2
     gpsDistanceMetres: { type: Number, default: null },
 
     // ── S3 assets ─────────────────────────────────────────────────
     s3VideoUri: { type: String },
     s3ThumbUri: { type: String },
 
-    // ── AI results (raw + processed) ─────────────────────────────
+    // ── AI results ────────────────────────────────────────────────
     aiResults: {
       textDetected  : { type: String },
       labels        : [String],
       infraScore    : { type: Number },
 
       // Layer 1 — Liveness
-      livenessResult: { type: String, enum: ["LIVE", "SUSPICIOUS", "SPOOF_DETECTED", "NO_FACE", "UNKNOWN"], default: "UNKNOWN" },
+      livenessResult: {
+        type   : String,
+        enum   : ["LIVE", "SUSPICIOUS", "SPOOF_DETECTED", "NO_FACE", "UNKNOWN"],
+        default: "UNKNOWN",
+      },
       livenessDetail: { type: String, default: "" },
 
       // Layer 3 — Screen recording
@@ -60,12 +65,32 @@ const SessionSchema = new mongoose.Schema(
 
     // ── Device / GPS ──────────────────────────────────────────────
     meta: {
-      device      : String,
-      isRooted    : { type: Boolean, default: false },
-      gpsStart    : { lat: Number, lng: Number },
-      gpsEnd      : { lat: Number, lng: Number },
-      appVersion  : String,
-      accelerometer: [{ x: Number, y: Number, z: Number, t: Number }],
+      device        : String,
+      isRooted      : { type: Boolean, default: false },
+      gpsStart      : { lat: Number, lng: Number },
+      gpsEnd        : { lat: Number, lng: Number },
+      appVersion    : String,
+      accelerometer : [{ x: Number, y: Number, z: Number, t: Number }],
+
+      // Layer 2 — full motion analysis result
+      motionAnalysis: {
+        result: {
+          type   : String,
+          enum   : ["NATURAL", "MINIMAL", "STATIONARY", "INSUFFICIENT_DATA", null],
+          default: null,
+        },
+        detail: { type: String, default: "" },
+        stats : {
+          sampleCount    : Number,
+          overallVariance: Number,
+          magnitudeMean  : Number,
+          magnitudeStdDev: Number,
+          magnitudeRange : Number,
+          xStd           : Number,
+          yStd           : Number,
+          zStd           : Number,
+        },
+      },
     },
 
     // ── Manual review ─────────────────────────────────────────────
@@ -76,9 +101,7 @@ const SessionSchema = new mongoose.Schema(
     // ── Audit trail ───────────────────────────────────────────────
     auditLog: { type: [AuditEntrySchema], default: [] },
   },
-  {
-    timestamps: true, // adds createdAt + updatedAt
-  }
+  { timestamps: true }
 );
 
 export default mongoose.model("Session", SessionSchema);
