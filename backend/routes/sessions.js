@@ -2,18 +2,18 @@
 //  Ghost Business Verifier — Sessions Routes
 //  routes/sessions.js
 // ═══════════════════════════════════════════════════════════════
-import express  from 'express';
-import Session  from '../models/Session.js';
-import Business from '../models/Business.js';
-import { io }   from '../index.js';
+import express from "express";
+import Session from "../models/Session.js";
+import Business from "../models/Business.js";
+import { io } from "../index.js";
 import {
   haversineDistance,
   computeInfraScore,
   computeSignageScore,
   computeTrustScore,
   deriveStatus,
-  GEO_DISTANCE_THRESHOLD_METRES
-} from '../config/scoring.js';
+  GEO_DISTANCE_THRESHOLD_METRES,
+} from "../config/scoring.js";
 
 const router = express.Router();
 
@@ -22,7 +22,7 @@ const router = express.Router();
 //  Called by React Native app when verification starts.
 //  Creates a PENDING session and immediately computes geo score.
 // ─────────────────────────────────────────────────────────────────
-router.post('/', async (req, res) => {
+router.post("/", async (req, res) => {
   try {
     const {
       sessionId,
@@ -33,38 +33,40 @@ router.post('/', async (req, res) => {
       device,
       isRooted,
       accelerometer,
-      appVersion
+      appVersion,
     } = req.body;
 
     // Validate required fields
     if (!sessionId || !businessId) {
-      return res.status(400).json({ error: 'sessionId and businessId are required' });
+      return res
+        .status(400)
+        .json({ error: "sessionId and businessId are required" });
     }
 
     // Block rooted devices immediately
     if (isRooted === true) {
       return res.status(403).json({
-        error : 'DEVICE_COMPROMISED',
-        message: 'Verification blocked: rooted/jailbroken device detected'
+        error: "DEVICE_COMPROMISED",
+        message: "Verification blocked: rooted/jailbroken device detected",
       });
     }
 
     // Look up registered address for this business
     let registeredCoords = null;
-    let registeredAddress = '';
+    let registeredAddress = "";
     const business = await Business.findOne({ businessId });
 
     if (business) {
       registeredCoords = {
         lat: business.registeredAddress.lat,
-        lng: business.registeredAddress.lng
+        lng: business.registeredAddress.lng,
       };
-      registeredAddress = business.registeredAddress.fullText || '';
+      registeredAddress = business.registeredAddress.fullText || "";
     } else {
       // For hackathon: use a mock registered address if business not found
       // In production: return 404 or create business record
       registeredCoords = { lat: 12.9716, lng: 77.5946 }; // mock Bengaluru
-      registeredAddress = 'Mock: Bengaluru, Karnataka';
+      registeredAddress = "Mock: Bengaluru, Karnataka";
     }
 
     // Compute geo score
@@ -82,21 +84,23 @@ router.post('/', async (req, res) => {
       businessId,
       businessName,
       registeredAddress,
-      status     :   'PENDING',
+      status: "PENDING",
       geoScore,
       gpsDistanceMetres,
       meta: {
         device,
-        isRooted  : isRooted ?? false,
+        isRooted: isRooted ?? false,
         gpsStart,
         gpsEnd,
         accelerometer: accelerometer?.slice(0, 300) ?? [], // cap at 300 samples
-        appVersion
+        appVersion,
       },
-      auditLog: [{
-        action: 'SESSION_CREATED',
-        detail: `GPS distance: ${gpsDistanceMetres?.toFixed(0) ?? 'unknown'}m. Geo score: ${geoScore}`
-      }]
+      auditLog: [
+        {
+          action: "SESSION_CREATED",
+          detail: `GPS distance: ${gpsDistanceMetres?.toFixed(0) ?? "unknown"}m. Geo score: ${geoScore}`,
+        },
+      ],
     });
 
     // If geo fails → flag immediately without waiting for AI
@@ -104,35 +108,43 @@ router.post('/', async (req, res) => {
       await Session.findOneAndUpdate(
         { sessionId },
         {
-          status    : 'FLAGGED',
+          status: "FLAGGED",
           trustScore: 0,
-          $push: { auditLog: { action: 'GEO_FAIL_FLAGGED', detail: `Distance ${gpsDistanceMetres?.toFixed(0)}m exceeds 100m threshold` } }
-        }
+          $push: {
+            auditLog: {
+              action: "GEO_FAIL_FLAGGED",
+              detail: `Distance ${gpsDistanceMetres?.toFixed(0)}m exceeds 100m threshold`,
+            },
+          },
+        },
       );
       // Emit early flag to dashboard
-      io.emit('session_flagged_geo', {
+      io.emit("session_flagged_geo", {
         sessionId,
         businessId,
         businessName,
         gpsDistanceMetres,
-        status: 'FLAGGED'
+        status: "FLAGGED",
       });
     }
 
     res.status(201).json({
-      success          : true,
-      sessionId        : session.sessionId,
+      success: true,
+      sessionId: session.sessionId,
       geoScore,
-      gpsDistanceMetres: gpsDistanceMetres ? parseFloat(gpsDistanceMetres.toFixed(1)) : null,
-      immediatelyFlagged: geoScore === 0
+      gpsDistanceMetres: gpsDistanceMetres
+        ? parseFloat(gpsDistanceMetres.toFixed(1))
+        : null,
+      immediatelyFlagged: geoScore === 0,
     });
-
   } catch (err) {
-    console.error('[POST /sessions]', err);
+    console.error("[POST /sessions]", err);
     if (err.code === 11000) {
-      return res.status(409).json({ error: 'Session ID already exists' });
+      return res.status(409).json({ error: "Session ID already exists" });
     }
-    res.status(500).json({ error: 'Failed to create session', message: err.message });
+    res
+      .status(500)
+      .json({ error: "Failed to create session", message: err.message });
   }
 });
 
@@ -142,7 +154,7 @@ router.post('/', async (req, res) => {
 //  Computes final trust score and emits Socket.io event.
 // ─────────────────────────────────────────────────────────────────
 // POST /api/sessions/ai-result
-router.post('/ai-result', async (req, res) => {
+router.post("/ai-result", async (req, res) => {
   try {
     const {
       s3Key,
@@ -151,7 +163,7 @@ router.post('/ai-result', async (req, res) => {
       infraScore,
       isFlagged,
       livenessResult,
-      sessionId: sessionIdFromBody  // ← Lambda can also send it directly
+      sessionId: sessionIdFromBody, // ← Lambda can also send it directly
     } = req.body;
 
     // Try to get sessionId — 3 fallback methods
@@ -164,43 +176,47 @@ router.post('/ai-result', async (req, res) => {
 
     // Method 2: Extract from s3Key format thumbnails/SESSIONID_timestamp.ext
     if (!sessionId && s3Key) {
-      const filename = s3Key.split('/').pop();         // "sess_abc_123.jpg"
-      const nameWithoutExt = filename.split('.')[0];   // "sess_abc_123"
-      const parts = nameWithoutExt.split('_');
+      const filename = s3Key.split("/").pop(); // "sess_abc_123.jpg"
+      const nameWithoutExt = filename.split(".")[0]; // "sess_abc_123"
+      const parts = nameWithoutExt.split("_");
 
       // Only extract if filename has at least 3 underscore-separated parts
       if (parts.length >= 3) {
-        sessionId = parts.slice(0, -1).join('_');      // everything except last timestamp
+        sessionId = parts.slice(0, -1).join("_"); // everything except last timestamp
       }
     }
 
     // Method 3: No session found — create a test/anonymous session for testing
     if (!sessionId) {
-      console.warn(`[ai-result] Could not extract sessionId from s3Key: ${s3Key}`);
-      console.warn('[ai-result] Creating anonymous test session for this result');
+      console.warn(
+        `[ai-result] Could not extract sessionId from s3Key: ${s3Key}`,
+      );
+      console.warn(
+        "[ai-result] Creating anonymous test session for this result",
+      );
 
       // For testing: compute and return score without saving to a real session
       const infraScoreVal = infraScore || 0;
-      const signScore     = 0.20; // no session to match against
-      const geoScore      = 0;    // no GPS data
+      const signScore = 0.2; // no session to match against
+      const geoScore = 0; // no GPS data
 
       const trustScore = Math.round(
-        (geoScore * 0.4 + signScore * 0.3 + infraScoreVal * 0.3) * 100
+        (geoScore * 0.4 + signScore * 0.3 + infraScoreVal * 0.3) * 100,
       );
 
-      const status = trustScore >= 70 ? 'PASSED'
-                   : trustScore >= 40 ? 'REVIEW' : 'FLAGGED';
+      const status =
+        trustScore >= 70 ? "PASSED" : trustScore >= 40 ? "REVIEW" : "FLAGGED";
 
       return res.json({
-        success    : true,
-        testMode   : true,
-        message    : 'No session found — returned computed score only (test mode)',
+        success: true,
+        testMode: true,
+        message: "No session found — returned computed score only (test mode)",
         trustScore,
         status,
         textDetected,
         labels,
-        infraScore : infraScoreVal,
-        isFlagged
+        infraScore: infraScoreVal,
+        isFlagged,
       });
     }
 
@@ -212,35 +228,35 @@ router.post('/ai-result', async (req, res) => {
 
       // Still return a useful response instead of crashing
       const infraScoreVal = infraScore || 0;
-      const signScore = textDetected && textDetected !== 'NONE' ? 0.85 : 0.20;
-      const geoScore  = 0;
+      const signScore = textDetected && textDetected !== "NONE" ? 0.85 : 0.2;
+      const geoScore = 0;
       const trustScore = Math.round(
-        (geoScore * 0.4 + signScore * 0.3 + infraScoreVal * 0.3) * 100
+        (geoScore * 0.4 + signScore * 0.3 + infraScoreVal * 0.3) * 100,
       );
-      const status = trustScore >= 70 ? 'PASSED'
-                   : trustScore >= 40 ? 'REVIEW' : 'FLAGGED';
+      const status =
+        trustScore >= 70 ? "PASSED" : trustScore >= 40 ? "REVIEW" : "FLAGGED";
 
       return res.json({
-        success    : true,
-        testMode   : true,
-        message    : `Session ${sessionId} not in DB — score computed without GPS`,
+        success: true,
+        testMode: true,
+        message: `Session ${sessionId} not in DB — score computed without GPS`,
         trustScore,
         status,
         textDetected,
         labels,
-        infraScore : infraScoreVal,
-        isFlagged
+        infraScore: infraScoreVal,
+        isFlagged,
       });
     }
 
     // ── Session found — full scoring ─────────────────────────────
-    const signScore  = computeSignageScore(textDetected, session.businessName);
+    const signScore = computeSignageScore(textDetected, session.businessName);
     const infraScoreVal = infraScore || 0;
 
     const trustScore = computeTrustScore({
-      geoScore  : session.geoScore,
+      geoScore: session.geoScore,
       signScore,
-      infraScore: infraScoreVal
+      infraScore: infraScoreVal,
     });
 
     const status = deriveStatus(trustScore, isFlagged, session.geoScore);
@@ -248,88 +264,98 @@ router.post('/ai-result', async (req, res) => {
     await Session.findOneAndUpdate(
       { sessionId },
       {
-        status,
-        trustScore,
-        signScore,
-        infraScore: infraScoreVal,
-        s3ThumbUri: s3Key,
-        aiResults : {
-          textDetected,
-          labels,
+        $set: {
+          status,
+          trustScore,
+          signScore,
           infraScore: infraScoreVal,
-          livenessResult: livenessResult ?? 'UNKNOWN',
-          isFlagged
+          s3ThumbUri: s3Key,
+          aiResults: {
+            textDetected,
+            labels,
+            infraScore: infraScoreVal,
+            livenessResult: livenessResult ?? "UNKNOWN",
+            isFlagged,
+          },
         },
         $push: {
           auditLog: {
-            action: 'AI_RESULT_RECEIVED',
-            detail : `Score: ${trustScore} | Status: ${status} | Labels: ${labels?.join(', ')}`
-          }
-        }
+            action: "AI_RESULT_RECEIVED",
+            detail: `Score: ${trustScore} | Status: ${status} | Labels: ${labels?.join(", ")}`,
+          },
+        },
       },
-      { new: true }
+      { new: true },
     );
 
-    io.emit('session_complete', {
+    io.emit("session_complete", {
       sessionId,
       trustScore,
       status,
-      labels     : labels ?? [],
+      labels: labels ?? [],
       textDetected,
-      infraScore : infraScoreVal,
+      infraScore: infraScoreVal,
       signScore,
-      geoScore   : session.geoScore,
+      geoScore: session.geoScore,
       isFlagged,
-      timestamp  : new Date().toISOString()
+      timestamp: new Date().toISOString(),
     });
 
-    console.log(`[ai-result] ✅ ${sessionId} → Score: ${trustScore} | Status: ${status}`);
+    console.log(
+      `[ai-result] ✅ ${sessionId} → Score: ${trustScore} | Status: ${status}`,
+    );
 
-    res.json({ success: true, sessionId, trustScore, status, signScore, infraScore: infraScoreVal });
-
+    res.json({
+      success: true,
+      sessionId,
+      trustScore,
+      status,
+      signScore,
+      infraScore: infraScoreVal,
+    });
   } catch (err) {
-    console.error('[POST /sessions/ai-result]', err);
-    res.status(500).json({ error: 'Failed to process AI result', message: err.message });
+    console.error("[POST /sessions/ai-result]", err);
+    res
+      .status(500)
+      .json({ error: "Failed to process AI result", message: err.message });
   }
 });
 // ─────────────────────────────────────────────────────────────────
 //  GET /api/sessions
 //  List all sessions with optional filtering.
 // ─────────────────────────────────────────────────────────────────
-router.get('/', async (req, res) => {
+router.get("/", async (req, res) => {
   try {
     const {
       status,
       businessId,
-      limit  = 100,
+      limit = 100,
       offset = 0,
-      sortBy = 'createdAt',
-      order  = 'desc'
+      sortBy = "createdAt",
+      order = "desc",
     } = req.query;
 
     const filter = {};
-    if (status)     filter.status     = status;
+    if (status) filter.status = status;
     if (businessId) filter.businessId = businessId;
 
-    const sessions = await Session
-      .find(filter)
-      .sort({ [sortBy]: order === 'asc' ? 1 : -1 })
+    const sessions = await Session.find(filter)
+      .sort({ [sortBy]: order === "asc" ? 1 : -1 })
       .skip(Number(offset))
       .limit(Number(limit))
-      .select('-auditLog -meta.accelerometer'); // exclude heavy fields from list
+      .select("-auditLog -meta.accelerometer"); // exclude heavy fields from list
 
     const total = await Session.countDocuments(filter);
 
     res.json({
-      data   : sessions,
+      data: sessions,
       total,
-      limit  : Number(limit),
-      offset : Number(offset)
+      limit: Number(limit),
+      offset: Number(offset),
     });
-
   } catch (err) {
-    console.error('[GET /sessions]', err);
-    res.status(500).json({ error: 'Failed to fetch sessions' });
+    console.error("[GET /sessions]", err);
+    res.status(500).json({ error: "Failed to fetch sessions" });
   }
 });
 
@@ -337,16 +363,18 @@ router.get('/', async (req, res) => {
 //  GET /api/sessions/:id
 //  Single session detail with full audit trail.
 // ─────────────────────────────────────────────────────────────────
-router.get('/:id', async (req, res) => {
+router.get("/:id", async (req, res) => {
   try {
     const session = await Session.findOne({ sessionId: req.params.id });
     if (!session) {
-      return res.status(404).json({ error: `Session not found: ${req.params.id}` });
+      return res
+        .status(404)
+        .json({ error: `Session not found: ${req.params.id}` });
     }
     res.json(session);
   } catch (err) {
-    console.error('[GET /sessions/:id]', err);
-    res.status(500).json({ error: 'Failed to fetch session' });
+    console.error("[GET /sessions/:id]", err);
+    res.status(500).json({ error: "Failed to fetch session" });
   }
 });
 
@@ -354,20 +382,20 @@ router.get('/:id', async (req, res) => {
 //  PATCH /api/sessions/:id/review
 //  Risk officer adds review notes.
 // ─────────────────────────────────────────────────────────────────
-router.patch('/:id/review', async (req, res) => {
+router.patch("/:id/review", async (req, res) => {
   try {
     const { notes, reviewedBy, newStatus } = req.body;
 
     const update = {
       reviewNotes: notes,
       reviewedBy,
-      reviewedAt : new Date(),
+      reviewedAt: new Date(),
       $push: {
         auditLog: {
-          action: 'MANUAL_REVIEW',
-          detail : `Reviewed by ${reviewedBy}. Notes: ${notes}. Status changed to: ${newStatus ?? 'unchanged'}`
-        }
-      }
+          action: "MANUAL_REVIEW",
+          detail: `Reviewed by ${reviewedBy}. Notes: ${notes}. Status changed to: ${newStatus ?? "unchanged"}`,
+        },
+      },
     };
 
     if (newStatus) update.status = newStatus;
@@ -375,34 +403,39 @@ router.patch('/:id/review', async (req, res) => {
     const session = await Session.findOneAndUpdate(
       { sessionId: req.params.id },
       update,
-      { new: true }
+      { new: true },
     );
 
     if (!session) {
-      return res.status(404).json({ error: 'Session not found' });
+      return res.status(404).json({ error: "Session not found" });
     }
 
-    io.emit('session_reviewed', { sessionId: req.params.id, newStatus, reviewedBy });
+    io.emit("session_reviewed", {
+      sessionId: req.params.id,
+      newStatus,
+      reviewedBy,
+    });
     res.json({ success: true, session });
-
   } catch (err) {
-    console.error('[PATCH /sessions/:id/review]', err);
-    res.status(500).json({ error: 'Failed to update review' });
+    console.error("[PATCH /sessions/:id/review]", err);
+    res.status(500).json({ error: "Failed to update review" });
   }
 });
 
 // ─────────────────────────────────────────────────────────────────
 //  DELETE /api/sessions/:id  (dev/admin only)
 // ─────────────────────────────────────────────────────────────────
-router.delete('/:id', async (req, res) => {
+router.delete("/:id", async (req, res) => {
   try {
-    if (process.env.NODE_ENV === 'production') {
-      return res.status(403).json({ error: 'Delete not allowed in production' });
+    if (process.env.NODE_ENV === "production") {
+      return res
+        .status(403)
+        .json({ error: "Delete not allowed in production" });
     }
     await Session.deleteOne({ sessionId: req.params.id });
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to delete session' });
+    res.status(500).json({ error: "Failed to delete session" });
   }
 });
 
