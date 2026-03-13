@@ -484,12 +484,15 @@ router.delete("/:id", async (req, res) => {
 router.post("/login", async (req, res) => {
   try {
     const { gstNumber, name } = req.body;
+    console.log("[POST /login]", gstNumber, name);
+
 
     const business = await Business.findOne({ gstNumber, name });
 
     if (!business) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
+    console.log(business)
 
     return res.status(200).json({ 
       success: true, 
