@@ -481,4 +481,27 @@ router.delete("/:id", async (req, res) => {
   }
 });
 
+router.post("/login", async (req, res) => {
+  try {
+    const { gstNumber, name } = req.body;
+
+    const business = await Business.findOne({ gstNumber, name });
+
+    if (!business) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    return res.status(200).json({ 
+      success: true, 
+      businessId: business.businessId, 
+      name: business.name 
+    });
+
+  } catch (err) {
+    console.error("[POST /login]", err);
+    res.status(500).json({ error: "Server error during login" });
+  }
+});
+
+
 export default router;

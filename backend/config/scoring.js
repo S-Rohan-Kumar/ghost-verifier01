@@ -71,9 +71,10 @@ export function computeTrustScore({ geoScore, signScore, infraScore, motionScore
 }
 
 export function deriveStatus(trustScore, isFlagged, geoScore) {
+  
   if (geoScore === 0)     return "FLAGGED";
   if (isFlagged === true) return "FLAGGED";
-  if (trustScore >= 70)   return "PASSED";
+  if (trustScore >= 75)   return "PASSED";
   if (trustScore >= 40)   return "REVIEW";
   return "FLAGGED";
 }
