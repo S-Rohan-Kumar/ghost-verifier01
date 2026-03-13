@@ -331,9 +331,40 @@ router.post("/:sessionId/submit", async (req, res) => {
     }
 
     const auditStatus = session.surpriseAudit?.auditStatus;
-    if (!auditStatus || auditStatus === "REJECTED" || auditStatus === "PASSED") {
-      return res.status(400).json({
-        error: `Cannot submit audit — current audit status is "${auditStatus ?? "null"}"`,
+
+    // No active audit at all
+    if (!auditStatus) {
+      return res.status(400).json({ error: `No active audit found for session "${sessionId}"` });
+    }
+
+    // Lambda already finished before the app called /submit.
+    // This happens when video upload is slow — thumbnail lands in S3,
+    // Lambda runs and writes PASSED/REJECTED, then the app finishes
+    // uploading the video and POSTs here. Don't return 400 — just save
+    // the video key + GPS and return success so the app closes normally.
+    if (auditStatus === "PASSED" || auditStatus === "REJECTED") {
+      const now = new Date();
+      await Session.findOneAndUpdate(
+        { sessionId },
+        {
+          $set: {
+            ...(auditS3VideoUri ? { "surpriseAudit.auditS3VideoUri": auditS3VideoUri } : {}),
+            ...(gps?.lat && gps?.lng ? { "surpriseAudit.auditGps": gps } : {}),
+          },
+          $push: {
+            auditLog: {
+              action: "AUDIT_SUBMIT_LATE",
+              detail: `App submitted after Lambda already finished (${auditStatus}). Video key stored.`,
+            },
+          },
+        }
+      );
+      console.log(`[audit/submit] Lambda already finished (${auditStatus}) — returning success to app`);
+      return res.json({
+        success    : true,
+        sessionId,
+        auditStatus,
+        message    : "Audit already processed. Result is ready.",
       });
     }
 
