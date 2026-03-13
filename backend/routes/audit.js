@@ -92,6 +92,7 @@ export async function autoTriggerAudit(sessionId, anchorS3Key) {
   // Notify dashboard so CaseDetail shows the AuditClockPanel immediately
   io.emit("audit_state_changed", {
     sessionId,
+    businessId   : session.businessId,
     auditStatus  : "REQUESTED",
     sessionStatus: "PASSED",
     auditDeadline: auditDeadline.toISOString(),
@@ -313,6 +314,58 @@ router.post("/cv-result", async (req, res) => {
   } catch (err) {
     console.error("[POST /audit/cv-result]", err);
     res.status(500).json({ error: "Failed to record CV result", message: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────
+//  GET /api/audit/pending?businessId=xxx
+//  Called by AuditOverlay on app mount to check whether this business
+//  has a live audit that was triggered while the app was closed.
+//  Returns the most recent non-terminal audit session, or 404.
+//  Non-terminal: REQUESTED | WARNING | REVIEW_PENDING | SUBMITTED
+// ─────────────────────────────────────────────────────────────────
+router.get("/pending", async (req, res) => {
+  try {
+    const { businessId } = req.query;
+    if (!businessId) {
+      return res.status(400).json({ error: "businessId query param required" });
+    }
+
+    const LIVE_STATUSES = ["REQUESTED", "WARNING", "REVIEW_PENDING", "SUBMITTED"];
+
+    const session = await Session.findOne(
+      {
+        businessId,
+        "surpriseAudit.auditStatus": { $in: LIVE_STATUSES },
+      },
+      { sessionId: 1, businessId: 1, businessName: 1, surpriseAudit: 1 }
+    ).sort({ "surpriseAudit.triggeredAt": -1 });
+
+    if (!session) {
+      return res.status(404).json({ pending: false });
+    }
+
+    const sa  = session.surpriseAudit;
+    const now = new Date();
+    const msRemaining = sa?.auditDeadline
+      ? Math.max(0, new Date(sa.auditDeadline).getTime() - now.getTime())
+      : null;
+
+    res.json({
+      pending      : true,
+      sessionId    : session.sessionId,
+      businessId   : session.businessId,
+      businessName : session.businessName,
+      auditStatus  : sa.auditStatus,
+      auditDeadline: sa.auditDeadline,
+      triggeredAt  : sa.triggeredAt,
+      msRemaining,
+      message      : "A surprise audit is pending. Please re-record at the same premises.",
+    });
+
+  } catch (err) {
+    console.error("[GET /audit/pending]", err);
+    res.status(500).json({ error: "Failed to check pending audit" });
   }
 });
 
