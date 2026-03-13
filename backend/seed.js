@@ -1,10 +1,10 @@
 // ═══════════════════════════════════════════════════════════════
-//  Ghost Business Verifier — Database Seed Script
+//  Ghost Business Verifier — Database Seed Script  (FIXED)
 //  seed.js
 //
 //  Run: node seed.js
-//  Seeds 25 sessions + 10 businesses into MongoDB.
-//  First 7 sessions are FLAGGED (demo purposes).
+//  Seeds 25 sessions + 8 businesses into MongoDB.
+//  Compatible with the updated Session.js schema.
 // ═══════════════════════════════════════════════════════════════
 import mongoose from 'mongoose';
 import dotenv   from 'dotenv';
@@ -113,52 +113,130 @@ const BUSINESSES = [
   }
 ];
 
-// ── Mock Sessions Data ────────────────────────────────────────────
+// ── Score helpers (mirrors scoring.js logic) ──────────────────────
+const INFRA_SCORE_MAP = {
+  'Desk': 0.20, 'Computer': 0.20, 'Office': 0.20, 'Sign': 0.20,
+  'Table': 0.15, 'Monitor': 0.15, 'Whiteboard': 0.15,
+  'Chair': 0.10, 'Printer': 0.10, 'Keyboard': 0.10,
+  'Bookcase': 0.10, 'Filing Cabinet': 0.10, 'Conference Room': 0.20
+};
+
+function computeInfra(labels) {
+  const raw = labels.reduce((sum, l) => sum + (INFRA_SCORE_MAP[l] || 0), 0);
+  return parseFloat(Math.min(raw, 1.0).toFixed(2));
+}
+
+function computeSignScore(text, bizName) {
+  if (!text || text === 'NONE') return 0.20;
+  const firstWord = bizName.toLowerCase().split(' ')[0];
+  if (text.toLowerCase().includes(firstWord)) return 0.85;
+  return 0.50;
+}
+
+function computeTrust(geoScore, signScore, infraScore) {
+  return Math.round((geoScore * 0.4 + signScore * 0.3 + infraScore * 0.3) * 100);
+}
+
+// ── Audit log helpers ─────────────────────────────────────────────
+function makeAuditLog(geoScore, gpsDistanceMetres, trustScore, status) {
+  const log = [
+    {
+      action   : 'SESSION_CREATED',
+      detail   : `GPS distance: ${Math.round(gpsDistanceMetres)}m. Geo score: ${geoScore}`,
+      timestamp: new Date(Date.now() - 5000)
+    }
+  ];
+
+  if (geoScore === 0) {
+    log.push({
+      action   : 'GEO_FAIL_FLAGGED',
+      detail   : `Distance ${Math.round(gpsDistanceMetres)}m exceeds 100m threshold`,
+      timestamp: new Date(Date.now() - 4000)
+    });
+  }
+
+  log.push({
+    action   : 'AI_RESULT_RECEIVED',
+    detail   : `Score: ${trustScore} | Status: ${status}`,
+    timestamp: new Date(Date.now() - 2000)
+  });
+
+  return log;
+}
+
+// ── Build all sessions ────────────────────────────────────────────
 function makeSessions() {
+  const now      = Date.now();
   const sessions = [];
 
-  // ── 7 FLAGGED sessions (ghost businesses / residential) ─────────
+  // ── 7 FLAGGED sessions ──────────────────────────────────────────
   const flaggedData = [
-    { biz: BUSINESSES[6], city: 'Bengaluru', offset: { lat: 0.05, lng: 0.06 },
-      labels: ['Bed', 'Pillow', 'Bedroom', 'Couch'], text: 'NONE', device: 'Samsung Galaxy S23' },
-    { biz: BUSINESSES[7], city: 'Mumbai', offset: { lat: 0.08, lng: 0.07 },
-      labels: ['Sofa', 'Television', 'Living Room'], text: 'NONE', device: 'iPhone 14' },
-    { biz: BUSINESSES[6], city: 'Bengaluru', offset: { lat: 0.051, lng: 0.061 },
-      labels: ['Bed', 'Refrigerator', 'Kitchen'], text: 'NONE', device: 'OnePlus 11' },
-    { biz: BUSINESSES[7], city: 'Mumbai', offset: { lat: 0.079, lng: 0.071 },
-      labels: ['Mattress', 'Pillow', 'Wardrobe'], text: 'NONE', device: 'Pixel 7' },
-    { biz: BUSINESSES[0], city: 'Bengaluru', offset: { lat: 0.15, lng: 0.14 }, // GPS far away
-      labels: ['Desk', 'Computer'], text: 'Global Tech Solutions', device: 'iPhone 15' },
-    { biz: BUSINESSES[1], city: 'Mumbai', offset: { lat: 0.12, lng: 0.11 },    // GPS far away
-      labels: ['Table', 'Chair'], text: 'Sunrise Exports', device: 'Samsung S24' },
-    { biz: BUSINESSES[6], city: 'Bengaluru', offset: { lat: 0.052, lng: 0.062 },
-      labels: ['Bed', 'Bathroom', 'Toilet'], text: 'NONE', device: 'Redmi Note 12' },
+    {
+      biz   : BUSINESSES[6], offset: { lat: 0.05,  lng: 0.06  },
+      labels: ['Bed', 'Pillow', 'Bedroom', 'Couch'],
+      text  : 'NONE', device: 'Samsung Galaxy S23'
+    },
+    {
+      biz   : BUSINESSES[7], offset: { lat: 0.08,  lng: 0.07  },
+      labels: ['Sofa', 'Television', 'Living Room'],
+      text  : 'NONE', device: 'iPhone 14'
+    },
+    {
+      biz   : BUSINESSES[6], offset: { lat: 0.051, lng: 0.061 },
+      labels: ['Bed', 'Refrigerator', 'Kitchen'],
+      text  : 'NONE', device: 'OnePlus 11'
+    },
+    {
+      biz   : BUSINESSES[7], offset: { lat: 0.079, lng: 0.071 },
+      labels: ['Mattress', 'Pillow', 'Wardrobe'],
+      text  : 'NONE', device: 'Pixel 7'
+    },
+    {
+      biz   : BUSINESSES[0], offset: { lat: 0.15,  lng: 0.14  }, // GPS far away
+      labels: ['Desk', 'Computer'],
+      text  : 'Global Tech Solutions', device: 'iPhone 15'
+    },
+    {
+      biz   : BUSINESSES[1], offset: { lat: 0.12,  lng: 0.11  }, // GPS far away
+      labels: ['Table', 'Chair'],
+      text  : 'Sunrise Exports', device: 'Samsung S24'
+    },
+    {
+      biz   : BUSINESSES[6], offset: { lat: 0.052, lng: 0.062 },
+      labels: ['Bed', 'Bathroom', 'Toilet'],
+      text  : 'NONE', device: 'Redmi Note 12'
+    },
   ];
 
   flaggedData.forEach((d, i) => {
-    const geoScore = i >= 4 ? 0 : 1; // last 2 flagged by GPS
-    const infraI   = geoScore === 0 ? 0.3 : 0.1;
-    const signS    = d.text !== 'NONE' ? 0.85 : 0.2;
-    const trust    = Math.round((geoScore * 0.4 + signS * 0.3 + infraI * 0.3) * 100);
+    // Sessions 0-3: GPS ok but residential labels → flagged by AI
+    // Sessions 4-6: GPS far away → flagged by geo
+    const geoScore          = i >= 4 ? 0 : 1;
+    const gpsDistanceMetres = geoScore === 0 ? 14500 + i * 200 : 60 + i * 5;
+    const infraScore        = computeInfra(d.labels);
+    const signScore         = computeSignScore(d.text, d.biz.name);
+    const trustScore        = computeTrust(geoScore, signScore, infraScore);
+    const createdAt         = new Date(now - (i + 1) * 3_600_000 * 2);
 
     sessions.push({
-      sessionId   : `sess_flagged_${i}_${Date.now() + i}`,
-      businessId  : d.biz.businessId,
-      businessName: d.biz.name,
-      status      : 'FLAGGED',
-      trustScore  : trust,
+      sessionId        : `sess_flagged_${i}_${now + i}`,
+      businessId       : d.biz.businessId,
+      businessName     : d.biz.name,
+      registeredAddress: d.biz.registeredAddress.fullText,
+      status           : 'FLAGGED',
+      trustScore,
       geoScore,
-      signScore   : signS,
-      infraScore  : infraI,
-      gpsDistanceMetres: geoScore === 0 ? 14500 + i * 200 : 85,
-      s3ThumbUri  : `thumbnails/sess_flagged_${i}_demo.jpg`,
-      s3VideoUri  : `videos/sess_flagged_${i}_demo.mp4`,
-      aiResults: {
-        textDetected: d.text,
-        labels      : d.labels,
-        infraScore  : infraI,
+      signScore,
+      infraScore,
+      gpsDistanceMetres,
+      s3ThumbUri : `thumbnails/sess_flagged_${i}_demo.jpg`,
+      s3VideoUri : `videos/sess_flagged_${i}_demo.mp4`,
+      aiResults  : {
+        textDetected  : d.text,
+        labels        : d.labels,
+        infraScore,
         livenessResult: 'LIVE',
-        isFlagged   : true
+        isFlagged     : true
       },
       meta: {
         device  : d.device,
@@ -172,57 +250,62 @@ function makeSessions() {
           lng: d.biz.registeredAddress.lng + d.offset.lng + 0.001
         }
       },
-      createdAt: new Date(Date.now() - (i + 1) * 3600000 * 2)
+      auditLog : makeAuditLog(geoScore, gpsDistanceMetres, trustScore, 'FLAGGED'),
+      createdAt,
+      updatedAt: createdAt
     });
   });
 
-  // ── 18 PASSED / REVIEW sessions (real businesses) ───────────────
+  // ── 18 PASSED / REVIEW sessions ─────────────────────────────────
   const passedData = [
-    { biz: BUSINESSES[0], labels: ['Desk', 'Computer', 'Monitor', 'Chair', 'Whiteboard'], text: 'Global Tech Solutions', device: 'iPhone 15 Pro' },
-    { biz: BUSINESSES[1], labels: ['Table', 'Computer', 'Printer', 'Chair'],              text: 'Sunrise Exports',        device: 'Samsung Galaxy S24' },
-    { biz: BUSINESSES[2], labels: ['Desk', 'Chair', 'Sign', 'Computer'],                  text: 'Metro Traders',          device: 'iPhone 14' },
-    { biz: BUSINESSES[3], labels: ['Computer', 'Desk', 'Whiteboard', 'Office'],           text: 'Infinity Consulting',    device: 'Pixel 8' },
-    { biz: BUSINESSES[4], labels: ['Desk', 'Chair', 'Printer', 'Sign'],                   text: 'Peak Solutions',         device: 'OnePlus 12' },
-    { biz: BUSINESSES[5], labels: ['Computer', 'Monitor', 'Desk', 'Chair'],               text: 'Urban Finance Corp',     device: 'iPhone 15' },
-    { biz: BUSINESSES[0], labels: ['Desk', 'Computer', 'Filing Cabinet'],                 text: 'Global Tech Solutions', device: 'Samsung S23' },
-    { biz: BUSINESSES[1], labels: ['Table', 'Chair', 'Whiteboard'],                       text: 'Sunrise Exports',        device: 'Redmi Note 13 Pro' },
-    { biz: BUSINESSES[2], labels: ['Desk', 'Computer'],                                   text: 'Metro Traders Association', device: 'iPhone 14 Pro' },
-    { biz: BUSINESSES[3], labels: ['Office', 'Computer', 'Desk'],                         text: 'Infinity Consulting LLP', device: 'Pixel 7a' },
-    { biz: BUSINESSES[4], labels: ['Chair', 'Table'],                                     text: 'NONE', device: 'OnePlus 11' },         // REVIEW
-    { biz: BUSINESSES[5], labels: ['Desk'],                                               text: 'NONE', device: 'Samsung A54' },        // REVIEW
-    { biz: BUSINESSES[0], labels: ['Computer', 'Monitor', 'Keyboard', 'Desk', 'Sign'],    text: 'Global Tech Solutions', device: 'iPhone 15 Plus' },
-    { biz: BUSINESSES[1], labels: ['Desk', 'Chair', 'Computer', 'Printer', 'Bookcase'],   text: 'Sunrise Exports Pvt',   device: 'Samsung Galaxy S24 Ultra' },
-    { biz: BUSINESSES[2], labels: ['Table', 'Whiteboard', 'Office'],                      text: 'Metro Traders',          device: 'iPhone 13' },
-    { biz: BUSINESSES[3], labels: ['Desk', 'Conference Room', 'Whiteboard'],              text: 'Infinity Consulting',    device: 'Pixel 6' },
-    { biz: BUSINESSES[4], labels: ['Desk', 'Computer', 'Chair', 'Sign'],                  text: 'Peak Solutions Ltd',     device: 'OnePlus 10 Pro' },
-    { biz: BUSINESSES[5], labels: ['Computer', 'Desk', 'Filing Cabinet', 'Office'],       text: 'Urban Finance',          device: 'iPhone 12' },
+    { biz: BUSINESSES[0], labels: ['Desk','Computer','Monitor','Chair','Whiteboard'], text: 'Global Tech Solutions',    device: 'iPhone 15 Pro' },
+    { biz: BUSINESSES[1], labels: ['Table','Computer','Printer','Chair'],             text: 'Sunrise Exports',          device: 'Samsung Galaxy S24' },
+    { biz: BUSINESSES[2], labels: ['Desk','Chair','Sign','Computer'],                 text: 'Metro Traders',            device: 'iPhone 14' },
+    { biz: BUSINESSES[3], labels: ['Computer','Desk','Whiteboard','Office'],          text: 'Infinity Consulting',      device: 'Pixel 8' },
+    { biz: BUSINESSES[4], labels: ['Desk','Chair','Printer','Sign'],                  text: 'Peak Solutions',           device: 'OnePlus 12' },
+    { biz: BUSINESSES[5], labels: ['Computer','Monitor','Desk','Chair'],              text: 'Urban Finance Corp',       device: 'iPhone 15' },
+    { biz: BUSINESSES[0], labels: ['Desk','Computer','Filing Cabinet'],               text: 'Global Tech Solutions',    device: 'Samsung S23' },
+    { biz: BUSINESSES[1], labels: ['Table','Chair','Whiteboard'],                     text: 'Sunrise Exports',          device: 'Redmi Note 13 Pro' },
+    { biz: BUSINESSES[2], labels: ['Desk','Computer'],                                text: 'Metro Traders Association',device: 'iPhone 14 Pro' },
+    { biz: BUSINESSES[3], labels: ['Office','Computer','Desk'],                       text: 'Infinity Consulting LLP',  device: 'Pixel 7a' },
+    { biz: BUSINESSES[4], labels: ['Chair','Table'],                                  text: 'NONE',                     device: 'OnePlus 11' },       // → REVIEW
+    { biz: BUSINESSES[5], labels: ['Desk'],                                           text: 'NONE',                     device: 'Samsung A54' },      // → REVIEW
+    { biz: BUSINESSES[0], labels: ['Computer','Monitor','Keyboard','Desk','Sign'],    text: 'Global Tech Solutions',    device: 'iPhone 15 Plus' },
+    { biz: BUSINESSES[1], labels: ['Desk','Chair','Computer','Printer','Bookcase'],   text: 'Sunrise Exports Pvt',      device: 'Samsung Galaxy S24 Ultra' },
+    { biz: BUSINESSES[2], labels: ['Table','Whiteboard','Office'],                    text: 'Metro Traders',            device: 'iPhone 13' },
+    { biz: BUSINESSES[3], labels: ['Desk','Conference Room','Whiteboard'],            text: 'Infinity Consulting',      device: 'Pixel 6' },
+    { biz: BUSINESSES[4], labels: ['Desk','Computer','Chair','Sign'],                 text: 'Peak Solutions Ltd',       device: 'OnePlus 10 Pro' },
+    { biz: BUSINESSES[5], labels: ['Computer','Desk','Filing Cabinet','Office'],      text: 'Urban Finance',            device: 'iPhone 12' },
   ];
 
   passedData.forEach((d, i) => {
-    const geoScore  = 1;
-    const signS     = computeSignScore(d.text, d.biz.name);
-    const infraI    = computeInfra(d.labels);
-    const trust     = Math.round((geoScore * 0.4 + signS * 0.3 + infraI * 0.3) * 100);
-    const status    = trust >= 70 ? 'PASSED' : 'REVIEW';
+    const geoScore          = 1;
+    const gpsDistanceMetres = 20 + Math.random() * 60;
+    const infraScore        = computeInfra(d.labels);
+    const signScore         = computeSignScore(d.text, d.biz.name);
+    const trustScore        = computeTrust(geoScore, signScore, infraScore);
+    const status            = trustScore >= 70 ? 'PASSED' : 'REVIEW';
+    const createdAt         = new Date(now - (i + 8) * 3_600_000 * 1.5);
 
     sessions.push({
-      sessionId   : `sess_real_${i}_${Date.now() + i + 100}`,
-      businessId  : d.biz.businessId,
-      businessName: d.biz.name,
+      sessionId        : `sess_real_${i}_${now + i + 100}`,
+      businessId       : d.biz.businessId,
+      businessName     : d.biz.name,
+      registeredAddress: d.biz.registeredAddress.fullText,
       status,
-      trustScore  : trust,
+      trustScore,
       geoScore,
-      signScore   : signS,
-      infraScore  : infraI,
-      gpsDistanceMetres: 20 + Math.random() * 60,
-      s3ThumbUri  : `thumbnails/sess_real_${i}_demo.jpg`,
-      s3VideoUri  : `videos/sess_real_${i}_demo.mp4`,
-      aiResults: {
-        textDetected: d.text,
-        labels      : d.labels,
-        infraScore  : infraI,
+      signScore,
+      infraScore,
+      gpsDistanceMetres,
+      s3ThumbUri : `thumbnails/sess_real_${i}_demo.jpg`,
+      s3VideoUri : `videos/sess_real_${i}_demo.mp4`,
+      aiResults  : {
+        textDetected  : d.text,
+        labels        : d.labels,
+        infraScore,
         livenessResult: 'LIVE',
-        isFlagged   : false
+        isFlagged     : false
       },
       meta: {
         device  : d.device,
@@ -236,61 +319,49 @@ function makeSessions() {
           lng: d.biz.registeredAddress.lng + (Math.random() - 0.5) * 0.0005
         }
       },
-      createdAt: new Date(Date.now() - (i + 8) * 3600000 * 1.5)
+      auditLog : makeAuditLog(geoScore, gpsDistanceMetres, trustScore, status),
+      createdAt,
+      updatedAt: createdAt
     });
   });
 
   return sessions;
 }
 
-// helpers for seed
-const SCORE_MAP = { Desk:0.2, Computer:0.2, Table:0.15, Chair:0.1, Monitor:0.15,
-                    Printer:0.1, Office:0.2, Sign:0.2, Whiteboard:0.15, Bookcase:0.1,
-                    'Conference Room':0.2, Keyboard:0.1, 'Filing Cabinet':0.1 };
-
-function computeInfra(labels) {
-  return parseFloat(Math.min(labels.reduce((a, l) => a + (SCORE_MAP[l] || 0), 0), 1.0).toFixed(2));
-}
-
-function computeSignScore(text, bizName) {
-  if (!text || text === 'NONE') return 0.20;
-  if (text.toLowerCase().includes(bizName.toLowerCase().split(' ')[0])) return 0.85;
-  return 0.50;
-}
-
 // ── Main ──────────────────────────────────────────────────────────
 async function seed() {
   try {
     await mongoose.connect(process.env.MONGODB_URI);
-    console.log('Connected to MongoDB');
+    console.log('✅ Connected to MongoDB');
 
-    // Clear existing data
     await Session.deleteMany({});
     await Business.deleteMany({});
-    console.log('Cleared existing data');
+    console.log('🗑️  Cleared existing data');
 
-    // Insert businesses
     await Business.insertMany(BUSINESSES);
-    console.log(`Inserted ${BUSINESSES.length} businesses`);
+    console.log(`🏢  Inserted ${BUSINESSES.length} businesses`);
 
-    // Insert sessions
     const sessions = makeSessions();
-    await Session.insertMany(sessions);
-    console.log(`Inserted ${sessions.length} sessions`);
+    await Session.insertMany(sessions, { timestamps: false }); // use our own createdAt
+    console.log(`📋  Inserted ${sessions.length} sessions`);
 
-    // Print summary
     const flagged = sessions.filter(s => s.status === 'FLAGGED').length;
     const passed  = sessions.filter(s => s.status === 'PASSED').length;
     const review  = sessions.filter(s => s.status === 'REVIEW').length;
-    console.log(`\n✅ Seed complete:`);
-    console.log(`   Total sessions : ${sessions.length}`);
-    console.log(`   PASSED         : ${passed}`);
-    console.log(`   REVIEW         : ${review}`);
-    console.log(`   FLAGGED        : ${flagged}`);
-    console.log(`   Businesses     : ${BUSINESSES.length}\n`);
+
+    console.log(`
+╔══════════════════════════════╗
+║       Seed Complete ✅        ║
+╠══════════════════════════════╣
+║  Total sessions : ${String(sessions.length).padEnd(9)} ║
+║  PASSED         : ${String(passed).padEnd(9)} ║
+║  REVIEW         : ${String(review).padEnd(9)} ║
+║  FLAGGED        : ${String(flagged).padEnd(9)} ║
+║  Businesses     : ${String(BUSINESSES.length).padEnd(9)} ║
+╚══════════════════════════════╝`);
 
   } catch (err) {
-    console.error('Seed failed:', err);
+    console.error('❌ Seed failed:', err);
   } finally {
     await mongoose.disconnect();
     process.exit(0);
