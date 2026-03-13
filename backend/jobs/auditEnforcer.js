@@ -171,7 +171,7 @@ function emitStateChange(sessionId, auditStatus, sessionStatus, auditDeadline) {
 // ─────────────────────────────────────────────────────────────────
 //  Schedule: every 15 minutes
 // ─────────────────────────────────────────────────────────────────
-cron.schedule("*/15 * * * *", async () => {
+cron.schedule("*/5 * * * * *", async () => {
   try {
     await enforcerTick();
   } catch (err) {
