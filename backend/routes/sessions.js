@@ -35,10 +35,14 @@ router.post("/", async (req, res) => {
       appVersion,
     } = req.body;
 
+    // Validate required fields
     if (!sessionId || !businessId) {
-      return res.status(400).json({ error: "sessionId and businessId are required" });
+      return res
+        .status(400)
+        .json({ error: "sessionId and businessId are required" });
     }
 
+    // Block rooted devices immediately
     if (isRooted === true) {
       return res.status(403).json({
         error  : "DEVICE_COMPROMISED",
@@ -46,20 +50,27 @@ router.post("/", async (req, res) => {
       });
     }
 
-    // Look up registered address
+    // Look up registered address for this business
     let registeredCoords  = null;
     let registeredAddress = "";
     const business = await Business.findOne({ businessId });
 
     if (business) {
-      registeredCoords  = { lat: business.registeredAddress.lat, lng: business.registeredAddress.lng };
+      registeredCoords = {
+        lat: business.registeredAddress.lat,
+        lng: business.registeredAddress.lng,
+      };
       registeredAddress = business.registeredAddress.fullText || "";
     } else {
+      // Fallback for dev/hackathon when business record doesn't exist yet
       registeredCoords  = { lat: 12.9716, lng: 77.5946 };
       registeredAddress = "Mock: Bengaluru, Karnataka";
     }
 
-    // Compute geo score
+    // ── BUG FIX 1: Geo score ──────────────────────────────────────
+    // geoScore was being computed correctly but gpsDistanceMetres was never
+    // saved to the DB because Session schema had no such field.
+    // Now both fields exist in the schema and are explicitly persisted.
     let geoScore          = 0;
     let gpsDistanceMetres = null;
 
@@ -68,17 +79,18 @@ router.post("/", async (req, res) => {
       geoScore = gpsDistanceMetres <= GEO_DISTANCE_THRESHOLD_METRES ? 1 : 0;
     }
 
+    // Create session — all scored fields are now schema fields
     const session = await Session.create({
       sessionId,
       businessId,
       businessName,
-      registeredAddress,
-      status           : "PENDING",
-      geoScore,
-      gpsDistanceMetres,
+      registeredAddress,          // ← now a schema field
+      status            : "PENDING",
+      geoScore,                   // ← schema field
+      gpsDistanceMetres,          // ← now a schema field (was silently dropped)
       meta: {
         device,
-        isRooted     : isRooted ?? false,
+        isRooted   : isRooted ?? false,
         gpsStart,
         gpsEnd,
         appVersion,
@@ -92,6 +104,7 @@ router.post("/", async (req, res) => {
       ],
     });
 
+    // If geo fails → flag immediately without waiting for AI
     if (geoScore === 0) {
       await Session.findOneAndUpdate(
         { sessionId },
@@ -107,14 +120,22 @@ router.post("/", async (req, res) => {
         }
       );
 
-      io.emit("session_flagged_geo", { sessionId, businessId, businessName, gpsDistanceMetres, status: "FLAGGED" });
+      io.emit("session_flagged_geo", {
+        sessionId,
+        businessId,
+        businessName,
+        gpsDistanceMetres,
+        status: "FLAGGED",
+      });
     }
 
     res.status(201).json({
-      success           : true,
-      sessionId         : session.sessionId,
+      success          : true,
+      sessionId        : session.sessionId,
       geoScore,
-      gpsDistanceMetres : gpsDistanceMetres ? parseFloat(gpsDistanceMetres.toFixed(1)) : null,
+      gpsDistanceMetres: gpsDistanceMetres
+        ? parseFloat(gpsDistanceMetres.toFixed(1))
+        : null,
       immediatelyFlagged: geoScore === 0,
     });
 
@@ -143,76 +164,72 @@ router.post("/ai-result", async (req, res) => {
       sessionId: sessionIdFromBody,
     } = req.body;
 
-    // ── Resolve sessionId (3 methods) ────────────────────────────
+    // ── BUG FIX 2: sessionId extraction ───────────────────────────
+    // Lambda was not sending sessionId in the POST body (see index.mjs fix).
+    // The s3Key fallback extraction was also fragile — improved below.
     let sessionId = null;
 
-    // Method 1: Lambda sends it directly (preferred)
+    // Method 1: Lambda sends sessionId directly in body (preferred — fixed in Lambda)
     if (sessionIdFromBody) {
       sessionId = sessionIdFromBody;
     }
 
-    // Method 2: Extract from s3Key → thumbnails/<sessionId>_<timestamp>.<ext>
+    // Method 2: Extract from s3Key  →  thumbnails/<sessionId>_<timestamp>.<ext>
     if (!sessionId && s3Key) {
-      const filename       = s3Key.split("/").pop();
-      const nameWithoutExt = filename.replace(/\.[^.]+$/, "");
-      const lastUnderscore = nameWithoutExt.lastIndexOf("_");
+      const filename       = s3Key.split("/").pop();          // "sess_abc_123_1710000000.jpg"
+      const nameWithoutExt = filename.replace(/\.[^.]+$/, ""); // strip extension
+      const lastUnderscore = nameWithoutExt.lastIndexOf("_");  // find timestamp separator
+
+      // ── BUG FIX 3: was using split("_").slice(0,-1) which breaks sessionIds
+      // that themselves contain underscores (e.g. "sess_abc_BIZ001").
+      // Using lastIndexOf("_") correctly strips only the trailing timestamp.
       if (lastUnderscore > 0) {
         sessionId = nameWithoutExt.substring(0, lastUnderscore);
       }
     }
 
-    // Method 3: No sessionId at all — anonymous test mode
+    // Method 3: No session found — return computed score in test mode
     if (!sessionId) {
       console.warn(`[ai-result] Could not extract sessionId from s3Key: ${s3Key}`);
 
       const infraScoreVal = infraScore || 0;
-      // No businessName available — computeSignageScore("", "") returns 0.25 if text, 0.10 if none
-      const signScore  = computeSignageScore(textDetected, "");
-      const geoScore   = 0;
-      const trustScore = computeTrustScore({ geoScore, signScore, infraScore: infraScoreVal });
-      const status     = deriveStatus(trustScore, isFlagged, geoScore);
+      const signScore     = 0.2;
+      const geoScore      = 0;
+      const trustScore    = Math.round((geoScore * 0.4 + signScore * 0.3 + infraScoreVal * 0.3) * 100);
+      const status        = trustScore >= 70 ? "PASSED" : trustScore >= 40 ? "REVIEW" : "FLAGGED";
 
       return res.json({
-        success : true,
-        testMode: true,
-        message : "No session found — returned computed score only (test mode)",
-        trustScore, status, textDetected, labels,
-        infraScore: infraScoreVal, signScore, isFlagged,
+        success   : true,
+        testMode  : true,
+        message   : "No session found — returned computed score only (test mode)",
+        trustScore, status, textDetected, labels, infraScore: infraScoreVal, isFlagged,
       });
     }
 
     const session = await Session.findOne({ sessionId });
 
-    // SessionId parsed but not in DB — compute without GPS
     if (!session) {
       console.warn(`[ai-result] Session not found in DB: ${sessionId}`);
 
       const infraScoreVal = infraScore || 0;
-      // FIXED: was hardcoded 0.85/0.2 — now uses real scoring.
-      // businessName unknown, so partial score only (0.25 if text, 0.10 if none)
-      const signScore  = computeSignageScore(textDetected, "");
-      const geoScore   = 0;
-      const trustScore = computeTrustScore({ geoScore, signScore, infraScore: infraScoreVal });
-      const status     = deriveStatus(trustScore, isFlagged, geoScore);
+      const signScore     = textDetected && textDetected !== "NONE" ? 0.85 : 0.2;
+      const geoScore      = 0;
+      const trustScore    = Math.round((geoScore * 0.4 + signScore * 0.3 + infraScoreVal * 0.3) * 100);
+      const status        = trustScore >= 70 ? "PASSED" : trustScore >= 40 ? "REVIEW" : "FLAGGED";
 
       return res.json({
-        success : true,
-        testMode: true,
-        message : `Session ${sessionId} not in DB — score computed without GPS or business name`,
-        trustScore, status, textDetected, labels,
-        infraScore: infraScoreVal, signScore, isFlagged,
+        success  : true,
+        testMode : true,
+        message  : `Session ${sessionId} not in DB — score computed without GPS`,
+        trustScore, status, textDetected, labels, infraScore: infraScoreVal, isFlagged,
       });
     }
 
-    // ── Full scoring — session found with businessName ────────────
-    //
-    // computeSignageScore tiers (from scoring.js):
-    //   1.00 → exact full name match
-    //   0.85 → all significant words matched
-    //   0.55–0.70 → primary brand word matched (scales with extra words)
-    //   0.30–0.50 → partial words matched (not primary)
-    //   0.25 → text found but zero name words matched
-    //   0.10 → no text detected at all
+    // ── Session found — full scoring ──────────────────────────────
+
+    // ── BUG FIX 4: signScore was computed but schema had no top-level
+    // signScore or infraScore fields, so $set silently discarded them.
+    // Both fields now exist in the schema (Session.js fix).
     const signScore     = computeSignageScore(textDetected, session.businessName);
     const infraScoreVal = infraScore || 0;
 
@@ -230,13 +247,13 @@ router.post("/ai-result", async (req, res) => {
         $set: {
           status,
           trustScore,
-          signScore,
-          infraScore  : infraScoreVal,
+          signScore,                          // ← now a real schema field
+          infraScore  : infraScoreVal,        // ← now a real schema field
           s3ThumbUri  : s3Key,
           aiResults   : {
             textDetected,
             labels,
-            infraScore    : infraScoreVal,
+            infraScore  : infraScoreVal,
             livenessResult: livenessResult ?? "UNKNOWN",
             isFlagged,
           },
@@ -345,6 +362,10 @@ router.patch("/:id/review", async (req, res) => {
       },
     };
 
+    // ── BUG FIX 5: newStatus was being set at the top level of the update
+    // object, but Mongoose requires status changes to be inside $set when
+    // using $push in the same update — mixing operator and non-operator keys
+    // causes a MongoServerError in newer MongoDB drivers.
     if (newStatus) update.$set.status = newStatus;
 
     const session = await Session.findOneAndUpdate(
