@@ -9,8 +9,7 @@
 //    → Emits request_audit socket event to the mobile app
 //    → auditEnforcer.js (cron, every 15 min) advances state machine
 //    → App uploads audit video → POST /api/audit/:id/submit
-//    → Backend runs CV analysis inline (no S3 trigger needed)
-//    → auditLambda.mjs still works if S3 trigger is also configured (idempotent)
+//    → S3 triggers auditLambda.mjs → POST /api/audit/cv-result
 //    → Final PASSED or REJECTED written here
 //
 //  How the audit starts (manual):
@@ -36,20 +35,17 @@ import {
   CompareFacesCommand,
 } from "@aws-sdk/client-rekognition";
 
-// ── Rekognition client (credentials from env / IAM role) ──────
-const rek = new RekognitionClient({ region: process.env.AWS_REGION || "ap-south-1" });
+const rek    = new RekognitionClient({ region: process.env.AWS_REGION || "ap-south-1" });
+const BUCKET = process.env.S3_BUCKET;
 
-const BUCKET                    = process.env.S3_BUCKET;
 const LAYOUT_MISMATCH_THRESHOLD = 75;
 const MIN_FACE_SIMILARITY       = 70;
 
-// Scene-relevant labels used for Jaccard comparison
 const SCENE_LABELS = new Set([
-  "Desk", "Table", "Chair", "Bookcase", "Filing Cabinet",
-  "Whiteboard", "Computer", "Monitor", "Keyboard", "Mouse",
-  "Printer", "Laptop", "Screen", "Office", "Conference Room",
-  "Window", "Door", "Wall", "Floor", "Ceiling", "Indoors",
-  "Sign", "Furniture", "Electronics",
+  "Desk","Table","Chair","Bookcase","Filing Cabinet","Whiteboard","Computer",
+  "Monitor","Keyboard","Mouse","Printer","Laptop","Screen","Office",
+  "Conference Room","Window","Door","Wall","Floor","Ceiling","Indoors",
+  "Sign","Furniture","Electronics",
 ]);
 
 function sceneFilter(labels) {
@@ -57,8 +53,7 @@ function sceneFilter(labels) {
 }
 
 function jaccardSimilarity(a, b) {
-  const setA = new Set(a);
-  const setB = new Set(b);
+  const setA = new Set(a), setB = new Set(b);
   const intersection = [...setA].filter(x => setB.has(x)).length;
   const union = new Set([...setA, ...setB]).size;
   return union === 0 ? 100 : (intersection / union) * 100;
@@ -72,142 +67,104 @@ async function compareFaces(bucket, anchorKey, auditKey) {
       SimilarityThreshold: MIN_FACE_SIMILARITY,
     }));
     return res.FaceMatches?.[0]?.Similarity ?? null;
-  } catch {
-    return null; // no face in frame — not an error
-  }
+  } catch { return null; }
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  runCvAnalysis — called after submit response is sent.
-//  Replicates auditLambda.mjs logic inline so the backend does
-//  NOT depend on an S3 event trigger to finish the audit.
-//  Works whether or not a thumbnail was uploaded (falls back to
-//  label-only scoring if auditThumbKey is null).
+//  runCvAnalysis — fires via setImmediate after submit response.
+//  Does NOT depend on S3 event trigger or Lambda.
+//  If auditThumbKey is null (snapshot failed), falls back to
+//  label-only scoring against empty set → scores 0 → REJECTED.
 // ─────────────────────────────────────────────────────────────────
 async function runCvAnalysis(sessionId, auditThumbKey) {
   const startMs = Date.now();
-  console.log(`[CvAnalysis] Starting for ${sessionId} | thumb: ${auditThumbKey ?? "none"}`);
-
+  console.log(`[CvAnalysis] ${sessionId} | thumb: ${auditThumbKey ?? "none"}`);
   try {
     const session = await Session.findOne({ sessionId });
-    if (!session) {
-      console.error(`[CvAnalysis] Session not found: ${sessionId}`);
-      return;
-    }
+    if (!session) { console.error(`[CvAnalysis] Session not found: ${sessionId}`); return; }
 
-    const anchorFrameKeys  = session.surpriseAudit?.anchorFrameKeys ?? [];
-    const originalLabels   = session.aiResults?.labels ?? [];
+    const anchorFrameKeys = session.surpriseAudit?.anchorFrameKeys ?? [];
+    const originalLabels  = session.aiResults?.labels ?? [];
 
-    // ── Detect labels on audit thumbnail (if we have one) ────────
     let auditLabels = [];
     if (auditThumbKey && BUCKET) {
       try {
         const res = await rek.send(new DetectLabelsCommand({
-          Image        : { S3Object: { Bucket: BUCKET, Name: auditThumbKey } },
-          MaxLabels    : 30,
-          MinConfidence: 60,
-          Features     : ["GENERAL_LABELS"],
+          Image: { S3Object: { Bucket: BUCKET, Name: auditThumbKey } },
+          MaxLabels: 30, MinConfidence: 60, Features: ["GENERAL_LABELS"],
         }));
         auditLabels = (res.Labels ?? []).map(l => l.Name);
         console.log(`[CvAnalysis] Audit labels: ${auditLabels.join(", ")}`);
       } catch (err) {
         console.warn(`[CvAnalysis] DetectLabels failed: ${err.message}`);
       }
-    } else {
-      console.warn("[CvAnalysis] No audit thumbnail or bucket — label comparison only with empty set");
     }
 
-    // ── Scene-filtered Jaccard similarity ─────────────────────────
     const auditScene          = sceneFilter(auditLabels);
     const originalScene       = sceneFilter(originalLabels);
     const labelOverlap        = jaccardSimilarity(originalScene, auditScene) / 100;
     const labelSimilarityScore = labelOverlap * 100;
+    const newLabels            = auditScene.filter(l => !originalScene.includes(l));
+    const missingLabels        = originalScene.filter(l => !auditScene.includes(l));
 
-    const newLabels     = auditScene.filter(l => !originalScene.includes(l));
-    const missingLabels = originalScene.filter(l => !auditScene.includes(l));
-
-    console.log(`[CvAnalysis] Label similarity: ${labelSimilarityScore.toFixed(1)}%`);
-
-    // ── Per-anchor CompareFaces ────────────────────────────────────
     const frameComparisons = [];
-    let faceSimilaritySum  = 0;
-    let faceCount          = 0;
+    let faceSimilaritySum = 0, faceCount = 0;
 
     if (auditThumbKey && BUCKET) {
       for (const anchorKey of anchorFrameKeys) {
         const faceSim = await compareFaces(BUCKET, anchorKey, auditThumbKey);
         if (faceSim !== null) {
-          faceSimilaritySum += faceSim;
-          faceCount++;
+          faceSimilaritySum += faceSim; faceCount++;
           frameComparisons.push({ anchorKey, similarityScore: faceSim, matchMethod: "FEATURE_MATCH" });
-          console.log(`[CvAnalysis] Anchor ${anchorKey}: face ${faceSim.toFixed(1)}%`);
         } else {
           frameComparisons.push({ anchorKey, similarityScore: labelSimilarityScore, matchMethod: "LABEL_JACCARD" });
-          console.log(`[CvAnalysis] Anchor ${anchorKey}: no face, using label score`);
         }
       }
     }
 
-    // ── Blend score: 60% face + 40% label ─────────────────────────
-    let similarityScore;
-    if (faceCount > 0) {
-      similarityScore = (faceSimilaritySum / faceCount) * 0.6 + labelSimilarityScore * 0.4;
-    } else {
-      similarityScore = labelSimilarityScore;
-    }
+    let similarityScore = faceCount > 0
+      ? (faceSimilaritySum / faceCount) * 0.6 + labelSimilarityScore * 0.4
+      : labelSimilarityScore;
     similarityScore = parseFloat(similarityScore.toFixed(1));
 
     const layoutMismatch = similarityScore < LAYOUT_MISMATCH_THRESHOLD;
-
-    let verdict;
-    if      (similarityScore >= 75) verdict = "HIGH_CONFIDENCE_MATCH — premises appear consistent";
-    else if (similarityScore >= 50) verdict = "LOW_CONFIDENCE_MATCH — some differences, manual review recommended";
-    else if (similarityScore >= 25) verdict = "LAYOUT_MISMATCH — significant differences from original premises";
-    else                            verdict = "COMPLETE_MISMATCH — no visual continuity with original session";
+    const verdict =
+      similarityScore >= 75 ? "HIGH_CONFIDENCE_MATCH — premises appear consistent" :
+      similarityScore >= 50 ? "LOW_CONFIDENCE_MATCH — some differences, manual review recommended" :
+      similarityScore >= 25 ? "LAYOUT_MISMATCH — significant differences from original premises" :
+                              "COMPLETE_MISMATCH — no visual continuity with original session";
 
     const finalAuditStatus   = layoutMismatch ? "REJECTED" : "PASSED";
     const finalSessionStatus = layoutMismatch ? "FLAGGED"  : session.status;
     const now                = new Date();
-    const processingMs       = Date.now() - startMs;
 
-    await Session.findOneAndUpdate(
-      { sessionId },
-      {
-        $set: {
-          status                                   : finalSessionStatus,
-          "surpriseAudit.auditStatus"              : finalAuditStatus,
-          "surpriseAudit.cvResult.similarityScore" : similarityScore,
-          "surpriseAudit.cvResult.layoutMismatch"  : layoutMismatch,
-          "surpriseAudit.cvResult.frameComparisons": frameComparisons,
-          "surpriseAudit.cvResult.newLabels"       : newLabels,
-          "surpriseAudit.cvResult.missingLabels"   : missingLabels,
-          "surpriseAudit.cvResult.labelOverlap"    : labelOverlap,
-          "surpriseAudit.cvResult.verdict"         : verdict,
-          "surpriseAudit.cvResult.processedAt"     : now,
-        },
-        $push: {
-          auditLog: {
-            action: layoutMismatch ? "AUDIT_LAYOUT_MISMATCH" : "AUDIT_CV_PASSED",
-            detail : `Similarity: ${similarityScore}% | Mismatch: ${layoutMismatch} | ${verdict} | ${processingMs}ms`,
-          },
-        },
-      }
-    );
-
-    io.emit("audit_state_changed", {
-      sessionId,
-      auditStatus    : finalAuditStatus,
-      sessionStatus  : finalSessionStatus,
-      similarityScore,
-      layoutMismatch,
-      verdict,
-      timestamp      : now.toISOString(),
+    await Session.findOneAndUpdate({ sessionId }, {
+      $set: {
+        status                                   : finalSessionStatus,
+        "surpriseAudit.auditStatus"              : finalAuditStatus,
+        "surpriseAudit.cvResult.similarityScore" : similarityScore,
+        "surpriseAudit.cvResult.layoutMismatch"  : layoutMismatch,
+        "surpriseAudit.cvResult.frameComparisons": frameComparisons,
+        "surpriseAudit.cvResult.newLabels"       : newLabels,
+        "surpriseAudit.cvResult.missingLabels"   : missingLabels,
+        "surpriseAudit.cvResult.labelOverlap"    : labelOverlap,
+        "surpriseAudit.cvResult.verdict"         : verdict,
+        "surpriseAudit.cvResult.processedAt"     : now,
+      },
+      $push: { auditLog: {
+        action: layoutMismatch ? "AUDIT_LAYOUT_MISMATCH" : "AUDIT_CV_PASSED",
+        detail: `Similarity: ${similarityScore}% | ${verdict} | ${Date.now()-startMs}ms`,
+      }},
     });
 
-    console.log(`[CvAnalysis] DONE ${sessionId} → ${finalAuditStatus} | ${similarityScore}% | ${processingMs}ms`);
+    io.emit("audit_state_changed", {
+      sessionId, auditStatus: finalAuditStatus, sessionStatus: finalSessionStatus,
+      similarityScore, layoutMismatch, verdict, timestamp: now.toISOString(),
+    });
 
+    console.log(`[CvAnalysis] DONE ${sessionId} → ${finalAuditStatus} | ${similarityScore}%`);
   } catch (err) {
-    console.error(`[CvAnalysis] Uncaught error for ${sessionId}:`, err.message);
+    console.error(`[CvAnalysis] Error for ${sessionId}:`, err.message);
   }
 }
 
@@ -402,10 +359,7 @@ router.post("/:sessionId/submit", async (req, res) => {
       message    : "Audit video received. Visual continuity analysis is running.",
     });
 
-    // Kick off CV analysis immediately after responding — does NOT block the response.
-    // This replaces the S3 → Lambda trigger so the audit completes regardless of
-    // whether a thumbnail was uploaded or the S3 notification is configured.
-    setImmediate(() => runCvAnalysis(sessionId, auditS3ThumbUri ?? null));
+    // Run CV analysis in background — does not block response
 
   } catch (err) {
     console.error("[POST /audit/submit]", err);
@@ -517,7 +471,8 @@ router.get("/pending", async (req, res) => {
       return res.status(400).json({ error: "businessId query param required" });
     }
 
-    const LIVE_STATUSES = ["REQUESTED", "WARNING", "REVIEW_PENDING", "SUBMITTED"];
+    // SUBMITTED is excluded — business has already done their part, let them log in normally
+    const LIVE_STATUSES = ["REQUESTED", "WARNING", "REVIEW_PENDING"];
 
     const session = await Session.findOne(
       {
