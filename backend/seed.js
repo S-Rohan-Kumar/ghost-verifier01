@@ -12,6 +12,12 @@ import Session  from './models/Session.js';
 import Business from './models/Business.js';
 dotenv.config();
 
+// Prevent accidental wipes in production unless explicitly allowed
+if (process.env.NODE_ENV === 'production' && !process.env.SEED_FORCE) {
+  console.error('Refusing to seed the database in production. Set SEED_FORCE=1 to override.');
+  process.exit(1);
+}
+
 // ── Mock Businesses ───────────────────────────────────────────────
 const BUSINESSES = [
   {
