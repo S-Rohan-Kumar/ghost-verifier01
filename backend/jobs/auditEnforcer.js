@@ -281,10 +281,10 @@ function emitStateChange(sessionId, auditStatus, sessionStatus, auditDeadline) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  Schedule: every 5 SECONDS — TESTING MODE (change back to "*/15 * * * *" for production)
+//  Schedule: every 15 minutes — PRODUCTION MODE
 // ─────────────────────────────────────────────────────────────────
 if (!isScheduled) {
-  cron.schedule("*/5 * * * * *", async () => {
+  cron.schedule("*/15 * * * *", async () => {
     try {
       await enforcerTick();
     } catch (err) {
@@ -292,7 +292,7 @@ if (!isScheduled) {
     }
   });
   isScheduled = true;
-  console.log("[AuditEnforcer] Scheduled — running every 5 seconds (testing mode).");
+  console.log("[AuditEnforcer] Scheduled — running every 15 minutes.");
 }
 
 export { enforcerTick }; // exported for tests
