@@ -507,4 +507,35 @@ router.post("/login", async (req, res) => {
   }
 });
 
+
+// ─────────────────────────────────────────────────────────────────
+//  POST /api/sessions/push-token
+//  Called by the mobile app after login to register the Expo
+//  push token against this business. Token is used by auditEnforcer
+//  to send push notifications when the app is closed/background.
+//
+//  Body: { businessId, pushToken }
+// ─────────────────────────────────────────────────────────────────
+router.post("/push-token", async (req, res) => {
+  try {
+    const { businessId, pushToken } = req.body;
+
+    if (!businessId || !pushToken) {
+      return res.status(400).json({ error: "businessId and pushToken are required" });
+    }
+
+    await Business.findOneAndUpdate(
+      { businessId },
+      { $set: { pushToken } }
+    );
+
+    console.log(`[push-token] Saved token for businessId: ${businessId}`);
+    res.json({ success: true });
+
+  } catch (err) {
+    console.error("[POST /push-token]", err);
+    res.status(500).json({ error: "Failed to save push token" });
+  }
+});
+
 export default router;

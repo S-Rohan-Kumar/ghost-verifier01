@@ -6,18 +6,29 @@
 //  Scans all live (non-terminal) audits and advances the state
 //  machine based on elapsed time since triggeredAt.
 //
-//  Install dep:  npm install node-cron
-//  Mount in app: import "./jobs/auditEnforcer.js"
-//                (import AFTER mongoose connects)
+//  ADDED: Expo Push Notifications at every threshold.
+//  Socket events still fire for when the app IS open.
+//  Push notifications fire for when the app is closed/background.
+//  Both run together — no conflict.
+//
+//  Install deps:  npm install node-cron
+//  Mount in app:  import "./jobs/auditEnforcer.js"
+//                 (import AFTER mongoose connects)
+//
+//  Required: Business model must have a pushToken field.
+//  Token is saved via POST /api/sessions/push-token (sessions.js).
 // ═══════════════════════════════════════════════════════════════
-import cron    from "node-cron";
-import Session from "../models/Session.js";
-import { io }  from "../index.js";
+import cron     from "node-cron";
+import Session  from "../models/Session.js";
+import Business from "../models/Business.js";
+import { io }   from "../index.js";
 
-const MS_PER_HOUR = 2 * 1000;
+const MS_PER_HOUR = 2 * 1000; // TESTING: 1 "hour" = 2 seconds → full 60h = 120 seconds
+// ── For testing: set MS_PER_HOUR = 2 * 1000 (1 "hour" = 2 seconds)
+// ── and change cron to "*/5 * * * * *" (every 5 seconds)
 
 // ── Thresholds (hours since triggeredAt) ──────────────────────
-const T_REMINDER       = 12;   // log a reminder, no status change
+const T_REMINDER       = 12;   // push reminder, no status change
 const T_WARNING        = 24;   // auditStatus → WARNING
 const T_REVIEW_PENDING = 48;   // auditStatus → REVIEW_PENDING, session → REVIEW
 const T_DEADLINE       = 60;   // auditStatus → REJECTED, session → FLAGGED
@@ -26,13 +37,60 @@ const T_DEADLINE       = 60;   // auditStatus → REJECTED, session → FLAGGED
 const LIVE_STATUSES = ["REQUESTED", "WARNING", "REVIEW_PENDING"];
 
 // ─────────────────────────────────────────────────────────────────
+//  sendPushNotification
+//  Uses Expo's push API — no SDK needed on the server, just fetch.
+//  Silently skips if pushToken is null (business hasn't granted
+//  notification permission or hasn't logged in via updated app).
+// ─────────────────────────────────────────────────────────────────
+async function sendPushNotification(pushToken, title, body) {
+  if (!pushToken) {
+    console.log(`  [Push] No token — skipping push notification`);
+    return;
+  }
+  try {
+    const res = await fetch("https://exp.host/--/api/v2/push/send", {
+      method : "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept"      : "application/json",
+      },
+      body: JSON.stringify({
+        to      : pushToken,
+        title,
+        body,
+        sound   : "default",
+        priority: "high",
+        data    : { type: "audit_notification" },
+      }),
+    });
+    const json = await res.json();
+    console.log(`  [Push] Sent to ${pushToken.slice(-8)} → ${JSON.stringify(json?.data?.status ?? json)}`);
+  } catch (err) {
+    // Never crash the enforcer over a failed push
+    console.warn(`  [Push] Failed: ${err.message}`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  getPushToken — fetch pushToken from Business model
+//  Returns null if not found — caller handles gracefully
+// ─────────────────────────────────────────────────────────────────
+async function getPushToken(businessId) {
+  try {
+    const business = await Business.findOne({ businessId }).select("pushToken");
+    return business?.pushToken ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
 //  Core tick — called by cron every 15 minutes
 // ─────────────────────────────────────────────────────────────────
 async function enforcerTick() {
   const now = new Date();
   console.log(`[AuditEnforcer] Tick at ${now.toISOString()}`);
 
-  // Pull only live audits — the partial index makes this fast
   const liveSessions = await Session.find({
     "surpriseAudit.auditStatus": { $in: LIVE_STATUSES },
   }).select("sessionId businessId businessName status surpriseAudit auditLog");
@@ -57,6 +115,7 @@ async function processSession(session, now) {
   const triggeredAt   = new Date(sa.triggeredAt);
   const hoursElapsed  = (now - triggeredAt) / MS_PER_HOUR;
   const currentStatus = sa.auditStatus;
+  const hoursLeft     = (T_DEADLINE - hoursElapsed).toFixed(0);
 
   console.log(`  [${session.sessionId}] ${currentStatus} | ${hoursElapsed.toFixed(1)}h elapsed`);
 
@@ -70,6 +129,14 @@ async function processSession(session, now) {
       extraSet       : {},
     });
     emitStateChange(session.sessionId, "REJECTED", "FLAGGED", sa.auditDeadline);
+
+    // Push notification — deadline missed
+    const token = await getPushToken(session.businessId);
+    await sendPushNotification(
+      token,
+      "🚩 Audit Deadline Missed",
+      `Your audit window for ${session.businessName} has expired. Your session has been flagged.`
+    );
     return;
   }
 
@@ -83,6 +150,24 @@ async function processSession(session, now) {
       extraSet       : {},
     });
     emitStateChange(session.sessionId, "REVIEW_PENDING", "REVIEW", sa.auditDeadline);
+
+    // Socket alert — works when app is open
+    io.emit("audit_reminder", {
+      sessionId     : session.sessionId,
+      businessId    : session.businessId,
+      businessName  : session.businessName,
+      auditDeadline : sa.auditDeadline,
+      hoursRemaining: hoursLeft,
+      message       : `Escalated: only ${hoursLeft} hours remaining. Submit your audit video immediately.`,
+    });
+
+    // Push notification — works when app is closed
+    const token = await getPushToken(session.businessId);
+    await sendPushNotification(
+      token,
+      "🔍 Audit Escalated",
+      `Your audit for ${session.businessName} has been escalated. Only ${hoursLeft} hours remaining — submit now.`
+    );
     return;
   }
 
@@ -90,19 +175,37 @@ async function processSession(session, now) {
   if (hoursElapsed >= T_WARNING && currentStatus === "REQUESTED") {
     await advanceState(session, {
       auditStatus    : "WARNING",
-      sessionStatus  : session.status,   // don't change session status yet
+      sessionStatus  : session.status,
       auditLogAction : "AUDIT_WARNING",
       auditLogDetail : `24h elapsed — status escalated to WARNING. User notified.`,
       extraSet       : { "surpriseAudit.warningSentAt": now },
     });
     emitStateChange(session.sessionId, "WARNING", session.status, sa.auditDeadline);
+
+    // Socket alert — works when app is open
+    io.emit("audit_reminder", {
+      sessionId     : session.sessionId,
+      businessId    : session.businessId,
+      businessName  : session.businessName,
+      auditDeadline : sa.auditDeadline,
+      hoursRemaining: hoursLeft,
+      message       : `Warning: 24 hours have passed. You have ${hoursLeft} hours left to submit your audit video.`,
+    });
+
+    // Push notification — works when app is closed
+    const token = await getPushToken(session.businessId);
+    await sendPushNotification(
+      token,
+      "⚠️ Audit Warning",
+      `${session.businessName}: 24 hours have passed. You have ${hoursLeft} hours left to submit your audit video.`
+    );
     return;
   }
 
-  // ── T+12: REMINDER (logged once, no status change) ──────────
+  // ── T+12: REMINDER (sent once, no status change) ─────────────
   if (
     hoursElapsed >= T_REMINDER &&
-    currentStatus === "REQUESTED"    &&
+    currentStatus === "REQUESTED" &&
     !sa.reminderSentAt
   ) {
     await Session.findOneAndUpdate(
@@ -118,21 +221,29 @@ async function processSession(session, now) {
       }
     );
 
-    // Push reminder to mobile app
+    // Socket event — works when app is open
     io.emit("audit_reminder", {
       sessionId     : session.sessionId,
       businessName  : session.businessName,
       auditDeadline : sa.auditDeadline,
       hoursRemaining: (T_DEADLINE - hoursElapsed).toFixed(1),
-      message       : `Reminder: you have ${(T_DEADLINE - hoursElapsed).toFixed(0)} hours left to submit your audit video.`,
+      message       : `Reminder: you have ${hoursLeft} hours left to submit your audit video.`,
     });
+
+    // Push notification — works when app is closed
+    const token = await getPushToken(session.businessId);
+    await sendPushNotification(
+      token,
+      "⏰ Audit Reminder",
+      `${session.businessName}: You have ${hoursLeft} hours left to submit your audit video.`
+    );
 
     console.log(`  [${session.sessionId}] Reminder sent at T+${hoursElapsed.toFixed(1)}h`);
   }
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  Helper: write state transition to DB
+//  Helper: write state transition to DB — unchanged
 // ─────────────────────────────────────────────────────────────────
 async function advanceState(session, { auditStatus, sessionStatus, auditLogAction, auditLogDetail, extraSet }) {
   await Session.findOneAndUpdate(
@@ -151,12 +262,11 @@ async function advanceState(session, { auditStatus, sessionStatus, auditLogActio
       },
     }
   );
-
   console.log(`  [${session.sessionId}] → auditStatus: ${auditStatus} | sessionStatus: ${sessionStatus}`);
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  Helper: broadcast state change to dashboard + app
+//  Helper: broadcast state change to dashboard + app — unchanged
 // ─────────────────────────────────────────────────────────────────
 function emitStateChange(sessionId, auditStatus, sessionStatus, auditDeadline) {
   io.emit("audit_state_changed", {
@@ -169,7 +279,7 @@ function emitStateChange(sessionId, auditStatus, sessionStatus, auditDeadline) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  Schedule: every 15 minutes
+//  Schedule: every 5 SECONDS — TESTING MODE (change back to "*/15 * * * *" for production)
 // ─────────────────────────────────────────────────────────────────
 cron.schedule("*/5 * * * * *", async () => {
   try {
