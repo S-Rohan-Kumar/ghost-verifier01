@@ -326,6 +326,7 @@ router.post("/ai-result", async (req, res) => {
             livenessResult: livenessResult ?? "UNKNOWN",
             livenessDetail: livenessDetail ?? "",
             isFlagged,
+            hasResidentialLabels: isFlaggedFromLambda,
             screenRecording: {
               detected  : screenIsFlagged,
               confidence: screenRecording?.confidence ?? null,
