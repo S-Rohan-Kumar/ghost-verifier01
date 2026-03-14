@@ -9,90 +9,94 @@ import mongoose from "mongoose";
 import cors from "cors";
 import dotenv from "dotenv";
 
-// Load environment variables first
 dotenv.config();
 
 // ── Route Imports ────────────────────────────────────────────────
-import sessionRoutes from "./routes/sessions.js";
-import uploadRoutes from "./routes/upload.js";
+import sessionRoutes  from "./routes/sessions.js";
+import uploadRoutes   from "./routes/upload.js";
 import businessRoutes from "./routes/businesses.js";
 import analyticsRoutes from "./routes/analytics.js";
-import auditRoutes from "./routes/audit.js";
+import auditRoutes    from "./routes/audit.js";
 
 // ── App Setup ────────────────────────────────────────────────────
-const app = express();
+const app    = express();
 const server = http.createServer(app);
 
-// ── Socket.io Setup ──────────────────────────────────────────────
+// ── Socket.io ────────────────────────────────────────────────────
 export const io = new Server(server, {
-  cors: {
-    origin: "*", // allow all origins for hackathon
-    methods: ["GET", "POST"],
-  },
+  cors: { origin: "*", methods: ["GET", "POST"] },
 });
 
 io.on("connection", (socket) => {
   console.log(`[Socket.io] Client connected: ${socket.id}`);
-  socket.on("disconnect", () => {
-    console.log(`[Socket.io] Client disconnected: ${socket.id}`);
-  });
+  socket.on("disconnect", () =>
+    console.log(`[Socket.io] Client disconnected: ${socket.id}`)
+  );
 });
 
 // ── Middleware ───────────────────────────────────────────────────
-app.use(cors({ origin: "*" })); // allow all for hackathon
-app.use(express.json({ limit: "10mb" })); // parse JSON bodies
+app.use(cors({ origin: "*" }));
+app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 
+// ── Request logger (shows every hit in Render logs) ──────────────
+app.use((req, _res, next) => {
+  console.log(`[REQ] ${req.method} ${req.path}`);
+  next();
+});
+
 // ── Routes ───────────────────────────────────────────────────────
-app.use("/api/sessions", sessionRoutes);
-app.use("/api/upload", uploadRoutes);
+app.use("/api/sessions",   sessionRoutes);
+app.use("/api/upload",     uploadRoutes);
 app.use("/api/businesses", businessRoutes);
-app.use("/api/analytics", analyticsRoutes);
-app.use("/api/audit", auditRoutes);
+app.use("/api/analytics",  analyticsRoutes);
+app.use("/api/audit",      auditRoutes);
 
 // ── Health Check ─────────────────────────────────────────────────
-app.get("/", (req, res) => {
+app.get("/", (_req, res) => {
   res.json({
     service: "Ghost Business Verifier API",
-    status: "running",
+    status : "running",
     version: "2.0.0",
-    time: new Date().toISOString(),
+    time   : new Date().toISOString(),
   });
 });
-
-// ── MongoDB Connection ───────────────────────────────────────────
-const connectDB = async () => {
-  try {
-    await mongoose.connect(process.env.MONGODB_URI);
-    console.log("[MongoDB] Connected successfully");
-
-    import("./jobs/auditEnforcer.js");
-  } catch (err) {
-    console.error("[MongoDB] Connection failed:", err.message);
-    // Retry after 5 seconds (helpful on Railway cold starts)
-    setTimeout(connectDB, 5000);
-  }
-};
 
 // ── Global Error Handler ─────────────────────────────────────────
-app.use((err, req, res, next) => {
+app.use((err, _req, res, _next) => {
   console.error("[Error]", err.stack);
-  res.status(500).json({
-    error: "Internal server error",
-    message:
-      process.env.NODE_ENV === "development"
-        ? err.message
-        : "Something went wrong",
-  });
+  res.status(500).json({ error: "Internal server error", message: err.message });
 });
 
-// ── Start Server ─────────────────────────────────────────────────
+// ── Start ────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
 
-connectDB().then(() => {
+const start = async () => {
+  let retries = 0;
+  while (retries < 5) {
+    try {
+      await mongoose.connect(process.env.MONGODB_URI);
+      console.log("[MongoDB] Connected successfully");
+      break;
+    } catch (err) {
+      retries++;
+      console.error(`[MongoDB] Connection failed (attempt ${retries}/5):`, err.message);
+      if (retries >= 5) {
+        console.error("[MongoDB] Could not connect after 5 attempts — exiting");
+        process.exit(1);  // let Render restart the service cleanly
+      }
+      await new Promise(r => setTimeout(r, 5000));
+    }
+  }
+
+  // Import enforcer ONCE after DB is confirmed connected
+  await import("./jobs/auditEnforcer.js");
+
   server.listen(PORT, () => {
     console.log(`\n🚀 Ghost Verifier Backend running on port ${PORT}`);
-    console.log(`   Health check: http://localhost:${PORT}/`);
-    console.log(`   Sessions API: http://localhost:${PORT}/api/sessions\n`);
+    console.log(`   Health: http://localhost:${PORT}/`);
+    console.log(`   API:    http://localhost:${PORT}/api/sessions\n`);
   });
-});
+};
+
+start();

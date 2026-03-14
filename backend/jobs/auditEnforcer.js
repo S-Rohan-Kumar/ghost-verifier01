@@ -36,6 +36,8 @@ const T_DEADLINE       = 60;   // auditStatus → REJECTED, session → FLAGGED
 // ── Statuses the enforcer still needs to process ──────────────
 const LIVE_STATUSES = ["REQUESTED", "WARNING", "REVIEW_PENDING"];
 
+let isScheduled = false; // Flag to prevent multiple cron schedules
+
 // ─────────────────────────────────────────────────────────────────
 //  sendPushNotification
 //  Uses Expo's push API — no SDK needed on the server, just fetch.
@@ -281,14 +283,16 @@ function emitStateChange(sessionId, auditStatus, sessionStatus, auditDeadline) {
 // ─────────────────────────────────────────────────────────────────
 //  Schedule: every 5 SECONDS — TESTING MODE (change back to "*/15 * * * *" for production)
 // ─────────────────────────────────────────────────────────────────
-cron.schedule("*/5 * * * * *", async () => {
-  try {
-    await enforcerTick();
-  } catch (err) {
-    console.error("[AuditEnforcer] Unhandled error in tick:", err.message);
-  }
-});
-
-console.log("[AuditEnforcer] Scheduled — running every 15 minutes.");
+if (!isScheduled) {
+  cron.schedule("*/5 * * * * *", async () => {
+    try {
+      await enforcerTick();
+    } catch (err) {
+      console.error("[AuditEnforcer] Unhandled error in tick:", err.message);
+    }
+  });
+  isScheduled = true;
+  console.log("[AuditEnforcer] Scheduled — running every 5 seconds (testing mode).");
+}
 
 export { enforcerTick }; // exported for tests
